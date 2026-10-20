@@ -24,7 +24,8 @@ class PAINTSTACK_UL_layers(UIList):
                  icon="HIDE_OFF" if layer.visible else "HIDE_ON")
 
 
-EFFECT_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "SNAP_FACE", "LEVELS": "FILTER", "BLUR": "FILTER"}
+EFFECT_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "SNAP_FACE", "LEVELS": "FILTER", "BLUR": "FILTER",
+                "ID_MASK": "EYEDROPPER"}
 
 
 class PAINTSTACK_UL_mask_effects(UIList):
@@ -49,7 +50,7 @@ class PAINTSTACK_MT_add_effect(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         for ident, label, _ in EFFECT_TYPES:
-            if ident in ("LEVELS", "PAINT"):
+            if ident in ("LEVELS", "PAINT", "ID_MASK"):
                 layout.separator()
             layout.operator("paintstack.effect_add", text=label,
                             icon=EFFECT_ICONS.get(ident, "TEXTURE")).type = ident
@@ -77,6 +78,12 @@ def draw_effect(layout, effect, ts):
         col.prop(effect, "gamma")
     elif t == "BLUR":
         col.prop(effect, "blur_radius")
+    elif t == "ID_MASK":
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(effect, "id_color", text="")
+        row.operator("paintstack.id_pick", text="Pick", icon="EYEDROPPER")
+        col.prop(effect, "id_tolerance")
     elif t in generators.REQUIRES:
         col = layout.column(align=True)
         col.prop(effect, "level")
@@ -254,14 +261,22 @@ class PAINTSTACK_PT_bake(PaintStackPanel, Panel):
             row.label(text="", icon="CHECKMARK" if ts.baked_map(ident) else "BLANK1")
         col = layout.column(align=True)
         if s.high_poly:
-            col.prop(s, "cage_extrusion")
+            col.prop(s, "cage_object")
+            sub = col.column(align=True)
+            sub.active = s.cage_object is None
+            sub.prop(s, "cage_extrusion")
             col.prop(s, "max_ray_distance")
+        if s.use_id:
+            col.prop(s, "id_source")
         col.prop(s, "ao_distance")
         col.prop(s, "thickness_distance")
         col.prop(s, "samples")
         col.prop(s, "margin")
+        row = layout.row()
         if ts.baked_map("NORMAL"):
-            layout.prop(ts, "use_baked_normal")
+            row.prop(ts, "use_baked_normal")
+        if ts.baked_map("AO"):
+            row.prop(ts, "preview_ao")
         layout.operator("paintstack.bake", icon="RENDER_STILL")
 
 

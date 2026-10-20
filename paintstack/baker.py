@@ -3,6 +3,8 @@ quantity (AO, pointiness, position, ...) and an EMIT bake writes it into the
 texture set's UV space. With a high poly set, maps are baked from it onto the
 low poly (selected-to-active), like Substance Painter's "bake mesh maps"."""
 
+import colorsys
+
 import bpy
 import numpy as np
 from bpy.types import Operator
@@ -30,7 +32,33 @@ def baked_image(mat, map_type):
 
 # Shader networks
 
-def _source_network(nt, map_type, settings, has_vcol):
+def id_color(index):
+    """Well-separated colour for the index-th material: golden-ratio hue steps keep
+    any two materials at least ~0.24 apart in hue."""
+    hue = (0.1 + index * 0.618033988749895) % 1.0
+    return colorsys.hsv_to_rgb(hue, 0.75, 0.9)
+
+
+def material_order(obj):
+    """Unique materials of obj in slot order; their index picks the ID colour."""
+    seen = []
+    for slot in obj.material_slots:
+        if slot.material is not None and slot.material not in seen:
+            seen.append(slot.material)
+    return seen
+
+
+def id_mode(settings, source):
+    if settings.id_source != "AUTO":
+        return settings.id_source
+    if getattr(source.data, "color_attributes", None):
+        return "VERTEX_COLOR"
+    if len([s for s in source.material_slots if s.material]) > 1:
+        return "MATERIAL"
+    return "MESH_PART"
+
+
+def _source_network(nt, map_type, settings, mode, color):
     """Nodes producing the baked quantity; returns the output socket."""
     n, link = nt.nodes, nt.links.new
     if map_type in ("AO", "THICKNESS"):
@@ -54,7 +82,11 @@ def _source_network(nt, map_type, settings, has_vcol):
         link(geo.outputs["Normal"], vm.inputs[0])
         return vm.outputs["Vector"]
     if map_type == "ID":
-        if has_vcol:
+        if mode == "MATERIAL":
+            rgb = n.new("ShaderNodeRGB")
+            rgb.outputs[0].default_value = (*color, 1.0)
+            return rgb.outputs[0]
+        if mode == "VERTEX_COLOR":
             return n.new("ShaderNodeVertexColor").outputs["Color"]
         geo = n.new("ShaderNodeNewGeometry")
         hsv = n.new("ShaderNodeCombineColor")
@@ -66,7 +98,7 @@ def _source_network(nt, map_type, settings, has_vcol):
     raise ValueError(map_type)
 
 
-def _bake_material(name, image, map_type, settings, has_vcol):
+def _bake_material(name, image, map_type, settings, mode, color=None):
     m = bpy.data.materials.new(name)
     if not m.node_tree:
         m.use_nodes = True
@@ -78,7 +110,7 @@ def _bake_material(name, image, map_type, settings, has_vcol):
     else:
         shader = nt.nodes.new("ShaderNodeEmission")
         shader.inputs["Strength"].default_value = 1.0
-        nt.links.new(_source_network(nt, map_type, settings, has_vcol), shader.inputs["Color"])
+        nt.links.new(_source_network(nt, map_type, settings, mode, color), shader.inputs["Color"])
     nt.links.new(shader.outputs[0], out.inputs["Surface"])
     tex = nt.nodes.new("ShaderNodeTexImage")
     tex.image = image
@@ -90,8 +122,8 @@ class _BakeEnvironment:
     """Temporarily swaps materials, selection, visibility and render settings,
     and puts everything back afterwards."""
 
-    def __init__(self, context, low, high):
-        self.context, self.low, self.high = context, low, high
+    def __init__(self, context, low, high, cage=None):
+        self.context, self.low, self.high, self.cage = context, low, high, cage
         self.slots, self.appended, self.temp_mats = [], [], []
 
     def __enter__(self):
@@ -102,7 +134,7 @@ class _BakeEnvironment:
         self.selection = [o for o in vl.objects if o.select_get()]
         self.active = vl.objects.active
         self.vis = [(o, o.hide_get(), o.hide_viewport, o.hide_render, o.hide_select)
-                    for o in (self.low, self.high) if o]
+                    for o in (self.low, self.high, self.cage) if o]
         if ctx.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
         scene.render.engine = "CYCLES"
@@ -111,8 +143,9 @@ class _BakeEnvironment:
             o.hide_viewport = o.hide_render = o.hide_select = False
         for o in vl.objects:
             o.select_set(False)
-        for o, *_ in self.vis:
-            o.select_set(True)
+        for o in (self.low, self.high):
+            if o:
+                o.select_set(True)
         vl.objects.active = self.low
         return self
 
@@ -193,64 +226,119 @@ def _postprocess_curvature(img, ts):
     pixels.write(img, pixels.rgba(np.stack([curv] * 3, -1), px[..., 3]))
 
 
+class BakeJob:
+    """Bakes maps one at a time so a modal operator can keep the UI alive between
+    maps. start() / step() until it returns False / finish()."""
+
+    def __init__(self, context, low, mat, maps):
+        self.context, self.low, self.mat = context, low, mat
+        self.ts = mat.paintstack
+        s = self.settings = self.ts.bake
+        self.high = s.high_poly if s.high_poly not in (None, low) else None
+        self.cage = s.cage_object if self.high and s.cage_object not in (None, low, self.high) else None
+        self.reports = []
+        self.maps = [m for m in BAKE_ORDER if m in maps]
+        if "NORMAL" in self.maps and self.high is None:
+            self.maps.remove("NORMAL")
+            self.reports.append(({"INFO"}, "Normal map skipped: set a High Poly object to bake it"))
+        self.done = []
+        self.env = None
+
+    @property
+    def next_label(self):
+        labels = {ident: label for ident, label, _ in BAKE_MAPS}
+        return labels[self.maps[len(self.done)]] if len(self.done) < len(self.maps) else ""
+
+    def start(self):
+        self.dummy = bpy.data.images.new("PS_bake_dummy", 8, 8, float_buffer=True)
+        self.env = _BakeEnvironment(self.context, self.low, self.high, self.cage).__enter__()
+
+    def step(self):
+        """Bake the next map. Returns True while more maps remain."""
+        if len(self.done) == len(self.maps):
+            return False
+        map_type = self.maps[len(self.done)]
+        env, s, mat, high = self.env, self.settings, self.mat, self.high
+        source = high or self.low
+        mode = id_mode(s, source)
+        img = baked_image(mat, map_type)
+        order = material_order(source)
+
+        def make(image, src_mat=None):
+            color = None
+            if mode == "MATERIAL":
+                color = id_color(order.index(src_mat) if src_mat in order else len(order))
+            m = _bake_material("PS_bake_tmp", image, map_type, s, mode, color)
+            env.temp_mats.append(m)
+            return m
+
+        per_material = map_type == "ID" and mode == "MATERIAL"
+        target, other = make(img), make(self.dummy)
+        if per_material and not high:
+            env.assign(self.low, lambda m: make(img if m == mat else self.dummy, m))
+        else:
+            env.assign(self.low, lambda m: target if m == mat else other)
+        if high:
+            env.assign(high, (lambda m: make(self.dummy, m)) if per_material else (lambda m: target))
+
+        self.context.scene.cycles.samples = s.samples if map_type in ("AO", "THICKNESS") else 4
+        kwargs = dict(
+            type="NORMAL" if map_type == "NORMAL" else "EMIT",
+            normal_space="TANGENT",
+            use_selected_to_active=high is not None,
+            cage_extrusion=s.cage_extrusion,
+            max_ray_distance=s.max_ray_distance,
+            margin=s.margin,
+            use_clear=True,
+            target="IMAGE_TEXTURES",
+        )
+        if self.cage:
+            kwargs.update(use_cage=True, cage_object=self.cage.name)
+        try:
+            bpy.ops.object.bake(**kwargs)
+        finally:
+            env.release_slots()
+        if map_type == "CURVATURE":
+            _postprocess_curvature(img, self.ts)
+        img.pack()
+        self.done.append(map_type)
+        return len(self.done) < len(self.maps)
+
+    def finish(self):
+        if self.env is not None:
+            self.env.__exit__(None, None, None)
+            self.env = None
+            bpy.data.images.remove(self.dummy)
+        if self.done:
+            generators.invalidate()
+            material.build(self.mat)
+            compositor.composite(self.mat)
+            labels = {ident: label for ident, label, _ in BAKE_MAPS}
+            self.reports.append(({"INFO"}, "Baked " + ", ".join(labels[m] for m in self.done)))
+        return self.reports
+
+
 def bake(context, low, mat, maps):
-    """Bake the given map types. Returns a list of (level, message) reports."""
-    ts = mat.paintstack
-    settings = ts.bake
-    high = settings.high_poly if settings.high_poly not in (None, low) else None
-    reports = []
-    maps = [m for m in BAKE_ORDER if m in maps]
-    if "NORMAL" in maps and high is None:
-        maps.remove("NORMAL")
-        reports.append(({"INFO"}, "Normal map skipped: set a High Poly object to bake it"))
-    if not maps:
-        return reports
-
-    source = high or low
-    has_vcol = bool(getattr(source.data, "color_attributes", None))
-    dummy = bpy.data.images.new("PS_bake_dummy", 8, 8, float_buffer=True)
-    wm = context.window_manager
-    wm.progress_begin(0, len(maps))
+    """Bake the given map types synchronously. Returns a list of (level, message) reports."""
+    job = BakeJob(context, low, mat, maps)
+    if not job.maps:
+        return job.reports
+    job.start()
     try:
-        with _BakeEnvironment(context, low, high) as env:
-            for i, map_type in enumerate(maps):
-                img = baked_image(mat, map_type)
-                target = _bake_material("PS_bake_target", img, map_type, settings, has_vcol)
-                other = _bake_material("PS_bake_other", dummy, map_type, settings, has_vcol)
-                env.temp_mats += [target, other]
-                env.assign(low, lambda m: target if m == mat else other)
-                if high:
-                    env.assign(high, lambda m: target)
-                context.scene.cycles.samples = settings.samples if map_type in ("AO", "THICKNESS") else 4
-                bpy.ops.object.bake(
-                    type="NORMAL" if map_type == "NORMAL" else "EMIT",
-                    normal_space="TANGENT",
-                    use_selected_to_active=high is not None,
-                    cage_extrusion=settings.cage_extrusion,
-                    max_ray_distance=settings.max_ray_distance,
-                    margin=settings.margin,
-                    use_clear=True,
-                    target="IMAGE_TEXTURES",
-                )
-                env.release_slots()
-                if map_type == "CURVATURE":
-                    _postprocess_curvature(img, ts)
-                img.pack()
-                wm.progress_update(i + 1)
+        while job.step():
+            pass
     finally:
-        wm.progress_end()
-        bpy.data.images.remove(dummy)
-
-    generators.invalidate()
-    material.build(mat)
-    compositor.composite(mat)
-    labels = {ident: label for ident, label, _ in BAKE_MAPS}
-    reports.append(({"INFO"}, "Baked " + ", ".join(labels[m] for m in maps)))
+        reports = job.finish()
     return reports
 
 
+def _selected_maps(ts):
+    return [m for m in BAKE_ORDER if getattr(ts.bake, "use_" + m.lower())]
+
+
 class PAINTSTACK_OT_bake(Operator):
-    """Bake mesh maps (normal, AO, curvature, thickness, position, ...) used by generators"""
+    """Bake mesh maps (normal, AO, curvature, thickness, position, ...) used by generators.
+    Maps bake one at a time; press Esc to stop after the current map"""
     bl_idname = "paintstack.bake"
     bl_label = "Bake Mesh Maps"
 
@@ -258,18 +346,66 @@ class PAINTSTACK_OT_bake(Operator):
     def poll(cls, context):
         return ops.texture_set(context)[0] is not None
 
+    def _report_all(self, reports):
+        for level, msg in reports:
+            self.report(level, msg)
+
     def execute(self, context):
         mat, ts = ops.texture_set(context)
-        s = ts.bake
-        maps = [m for m in BAKE_ORDER if getattr(s, "use_" + m.lower())]
         try:
-            reports = bake(context, context.active_object, mat, maps)
+            reports = bake(context, context.active_object, mat, _selected_maps(ts))
         except RuntimeError as e:
             self.report({"ERROR"}, f"Bake failed: {e}")
             return {"CANCELLED"}
-        for level, msg in reports:
-            self.report(level, msg)
+        self._report_all(reports)
         return {"FINISHED"}
+
+    def invoke(self, context, event):
+        mat, ts = ops.texture_set(context)
+        self.job = BakeJob(context, context.active_object, mat, _selected_maps(ts))
+        if not self.job.maps:
+            self._report_all(self.job.reports)
+            return {"CANCELLED"}
+        self.job.start()
+        wm = context.window_manager
+        wm.progress_begin(0, len(self.job.maps))
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        wm.modal_handler_add(self)
+        self._status(context)
+        return {"RUNNING_MODAL"}
+
+    def _status(self, context):
+        n = len(self.job.done)
+        context.workspace.status_text_set(
+            f"PaintStack: baking {self.job.next_label} ({n + 1}/{len(self.job.maps)}) · Esc to stop")
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+    def _end(self, context, cancelled=False):
+        wm = context.window_manager
+        wm.event_timer_remove(self._timer)
+        wm.progress_end()
+        context.workspace.status_text_set(None)
+        self._report_all(self.job.finish())
+        if cancelled:
+            self.report({"WARNING"}, "Bake stopped")
+        return {"CANCELLED"} if cancelled and not self.job.done else {"FINISHED"}
+
+    def modal(self, context, event):
+        if event.type == "ESC" and event.value == "PRESS":
+            return self._end(context, cancelled=True)
+        if event.type != "TIMER":
+            return {"RUNNING_MODAL"}
+        try:
+            more = self.job.step()
+        except RuntimeError as e:
+            self.report({"ERROR"}, f"Bake failed: {e}")
+            return self._end(context, cancelled=True)
+        context.window_manager.progress_update(len(self.job.done))
+        if not more:
+            return self._end(context)
+        self._status(context)
+        return {"RUNNING_MODAL"}
 
 
 classes = (PAINTSTACK_OT_bake,)

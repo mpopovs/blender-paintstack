@@ -3,10 +3,11 @@
 import bpy
 from bpy.app.handlers import persistent
 
-from . import baker, export, ops, paint_mode, props, ui, undo
+from . import baker, export, ops, paint_mode, picking, props, ui, undo
 from .pixels import PREFIX
 
-_classes = ops.classes + paint_mode.classes + baker.classes + export.classes + ui.classes
+_classes = (ops.classes + paint_mode.classes + picking.classes + baker.classes + export.classes
+            + ui.classes)
 
 
 @persistent

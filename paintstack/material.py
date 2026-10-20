@@ -40,6 +40,24 @@ def _unlink(nt, socket):
         nt.links.remove(link)
 
 
+def _multiply_ao(nt, color_out, ao_image, location):
+    ao = nt.nodes.new("ShaderNodeTexImage")
+    ao.name = ao.label = NODE_PREFIX + "Baked AO"
+    ao.image = ao_image
+    ao.location = (location[0] - 300, location[1] - 60)
+    ao.hide = True
+    mix = nt.nodes.new("ShaderNodeMix")
+    mix.name = NODE_PREFIX + "AO Multiply"
+    mix.data_type = "RGBA"
+    mix.blend_type = "MULTIPLY"
+    mix.location = location
+    sock = {s.identifier: s for s in mix.inputs}
+    sock["Factor_Float"].default_value = 1.0
+    nt.links.new(color_out, sock["A_Color"])
+    nt.links.new(ao.outputs["Color"], sock["B_Color"])
+    return next(s for s in mix.outputs if s.identifier == "Result_Color")
+
+
 def build(mat):
     ts = mat.paintstack
     if not ts.initialized:
@@ -97,6 +115,9 @@ def build(mat):
         if sock is None:
             continue
         _unlink(nt, sock)
-        nt.links.new(tex.outputs["Color"], sock)
+        color_out = tex.outputs["Color"]
+        if ch.id == "BASE_COLOR" and ts.preview_ao and ts.baked_map("AO") is not None:
+            color_out = _multiply_ao(nt, color_out, ts.baked_map("AO"), (x + 300, y))
+        nt.links.new(color_out, sock)
         if ch.id == "EMISSION" and "Emission Strength" in bsdf.inputs:
             bsdf.inputs["Emission Strength"].default_value = 1.0

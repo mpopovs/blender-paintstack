@@ -43,6 +43,7 @@ EFFECT_TYPES = [
     ("THICKNESS", "Thickness", "Thin areas from the baked thickness map"),
     ("POSITION", "Position Gradient", "Gradient along an object axis (needs Position)"),
     ("NOISE", "3D Noise", "Seamless noise sampled at the baked positions"),
+    ("ID_MASK", "Color Selection", "Select areas by their baked ID colour (needs ID)"),
     ("LEVELS", "Levels", "Remap the mask below"),
     ("BLUR", "Blur", "Blur the mask below"),
 ]
@@ -54,7 +55,7 @@ BAKE_MAPS = [
     ("THICKNESS", "Thickness", ""),
     ("POSITION", "Position", "Bounding-box normalised object position"),
     ("WORLD_NORMAL", "World Normal", ""),
-    ("ID", "ID", "Vertex colours, or a random colour per mesh part"),
+    ("ID", "ID", "Colour per vertex colour, material or mesh part"),
 ]
 
 
@@ -105,6 +106,9 @@ class PS_MaskEffect(PropertyGroup):
     gamma: FloatProperty(name="Gamma", min=0.05, max=10.0, default=1.0, update=_recomposite)
     blur_radius: IntProperty(name="Radius", min=1, max=64, default=4, subtype="PIXEL",
                              update=_recomposite)
+    id_color: FloatVectorProperty(name="ID Color", subtype="COLOR", size=3, min=0.0, max=1.0,
+                                  default=(1.0, 1.0, 1.0), update=_recomposite)
+    id_tolerance: FloatProperty(name="Tolerance", min=0.001, max=1.0, default=0.1, update=_recomposite)
     # PAINT effects: RGBA, value in R, coverage in A
     image: PointerProperty(type=bpy.types.Image)
 
@@ -167,6 +171,15 @@ class PS_BakeSettings(PropertyGroup):
     max_ray_distance: FloatProperty(name="Max Ray Distance", min=0.0, default=0.0, unit="LENGTH")
     ao_distance: FloatProperty(name="AO Distance", min=0.001, default=0.5, unit="LENGTH")
     thickness_distance: FloatProperty(name="Thickness Distance", min=0.001, default=0.5, unit="LENGTH")
+    cage_object: PointerProperty(name="Cage", type=bpy.types.Object, poll=_poll_high_poly,
+                                 description="Optional cage mesh (same topology as the low poly) "
+                                             "that rays start from; overrides Cage Extrusion")
+    id_source: EnumProperty(
+        name="ID Source",
+        items=[("AUTO", "Auto", "Vertex colours if present, else materials if several, else mesh parts"),
+               ("VERTEX_COLOR", "Vertex Color", "Active colour attribute"),
+               ("MATERIAL", "Material", "One colour per material"),
+               ("MESH_PART", "Mesh Part", "One colour per connected mesh part")])
     samples: IntProperty(name="Samples", min=1, max=1024, default=32)
     margin: IntProperty(name="Margin", min=0, max=64, default=8, subtype="PIXEL")
     use_normal: BoolProperty(name="Normal", default=True)
@@ -204,6 +217,9 @@ class PS_TextureSet(PropertyGroup):
     baked: CollectionProperty(type=PS_BakedMap)
     bake: PointerProperty(type=PS_BakeSettings)
     use_baked_normal: BoolProperty(name="Use Baked Normal", default=True, update=_rebuild_material)
+    preview_ao: BoolProperty(name="Multiply AO", default=False, update=_rebuild_material,
+                             description="Darken the material's base colour by the baked AO "
+                                         "(viewport and render; exports are unaffected)")
 
     @property
     def res(self):

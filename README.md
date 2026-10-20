@@ -10,7 +10,7 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.2)
+## Features (v0.2.1)
 
 ### Phase 2: baking and smart masks
 - **Mesh-map baker** (Cycles): Normal (high → low, cage extrusion and max ray distance), Ambient Occlusion, Curvature, Thickness, Position, World Normal, ID. Baking works from the low poly alone, or from a high-poly object onto the low poly
@@ -21,6 +21,11 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 - Painting on a mask that has generators automatically adds a **Paint** effect on top, so hand touch-ups work like in Substance
 - The baked normal is wired into the material (it is combined with the painted height), and baked AO feeds Unreal ORM, the Unity MaskMap and glTF Occlusion on export
 - Resolution option of 256 for quick look-dev
+- **Color Selection** mask: click the model with the eyedropper to pick its baked ID colour, then adjust Tolerance. The ID source can be vertex colours, materials (well-separated colours) or mesh parts
+- **Custom cage object** for high → low bakes
+- **Non-blocking bake**: maps bake one at a time with progress in the status bar; Esc stops after the current map, and scene state is always restored
+- **Fast generators**: noise runs on the GPU (same tables as the CPU fallback, so results match exactly), and noise and sources are cached separately from Level, Softness and Noise amount, so dragging those sliders is near-instant
+- **Multiply AO** option darkens the material's base colour by the baked AO (viewport and render; exports are unaffected)
 
 ### Phase 1: core painting
 
@@ -73,7 +78,9 @@ paintstack/
   material.py       Principled BSDF wiring (touches only PS_* nodes)
   masks.py          mask stack evaluation (paint / fill / generators / levels / blur)
   generators.py     edge wear, dirt, curvature, AO, thickness, position, 3D noise
-  baker.py          Cycles mesh-map baker with temporary emission materials
+  baker.py          Cycles mesh-map baker (stepwise BakeJob, modal operator)
+  picking.py        eyedropper: ray -> UV -> baked ID colour
+  engine/noise_gpu.py  GLSL fBm noise for generators
   engine/shaders.py GLSL: depth prepass, UV-space brush dab, UV coverage
   engine/projector.py  mesh → GPU batches, stroke-mask accumulation
   stroke.py         dab spacing, mirror, applying the stroke mask to all target channels
@@ -94,6 +101,7 @@ pip install bpy numpy          # bpy wheel must match your Python version
 # Debian/Ubuntu: apt install libegl1 libegl-mesa0 libgl1-mesa-dri
 python tests/test_headless.py  # Phase 1: compositing, projection, occlusion, undo, masks, export, save/load
 python tests/test_phase2.py    # Phase 2: high->low bake, every map, generators, mask stack, AO in export
+python tests/test_phase2_extras.py  # ID by material, ray pick + colour selection, cage, cancelled jobs, GPU noise
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render
 ```

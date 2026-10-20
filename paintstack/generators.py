@@ -17,9 +17,10 @@ REQUIRES = {
     "THICKNESS": ("THICKNESS",),
     "POSITION": ("POSITION",),
     "NOISE": (),
+    "ID_MASK": ("ID",),
 }
 
-_CACHE_SIZE = 24
+_CACHE_SIZE = 32
 _cache = OrderedDict()
 _generation = 0
 
@@ -65,33 +66,50 @@ def missing(effect, ts):
 
 # Noise
 
-def _hash(ix, iy, iz, seed):
-    h = (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791) ^ (seed * 2654435761 + 1013904223)
-    h = (h ^ (h >> 13)) * 1274126177
-    return ((h ^ (h >> 16)) & 0xFFFF).astype(np.float32) * (1.0 / 65535.0)
+_tables = {}
+
+
+def _table(seed):
+    """Permutation (doubled to avoid wrapping) and lattice values for a seed."""
+    if seed not in _tables:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(256).astype(np.int32)
+        _tables[seed] = (np.concatenate([perm, perm]), rng.random(256, dtype=np.float32))
+    return _tables[seed]
 
 
 def value_noise(p, seed=0):
-    """Smooth 3D value noise in [0, 1] for points p of shape (..., 3)."""
-    i = np.floor(p).astype(np.int64)
-    f = (p - i).astype(np.float32)
+    """Smooth 3D value noise in [0, 1] for points p of shape (..., 3).
+    Lattice hashing is shared between corners (2 + 4 + 8 table lookups), and the
+    corners are combined with nested lerps."""
+    perm, vals = _table(seed)
+    fl = np.floor(p)
+    f = (p - fl).astype(np.float32)
+    i = fl.astype(np.int32) & 255
     u = f * f * (3.0 - 2.0 * f)
-    out = np.zeros(p.shape[:-1], np.float32)
-    for dx in (0, 1):
-        wx = u[..., 0] if dx else 1.0 - u[..., 0]
+    ux, uy, uz = u[..., 0], u[..., 1], u[..., 2]
+    ix, iy, iz = i[..., 0], i[..., 1], i[..., 2]
+
+    def lerp(a, b, t):
+        return a + (b - a) * t
+
+    hx = (perm[ix], perm[ix + 1])
+    layers = []
+    for dz in (0, 1):
+        rows = []
         for dy in (0, 1):
-            wy = u[..., 1] if dy else 1.0 - u[..., 1]
-            for dz in (0, 1):
-                wz = u[..., 2] if dz else 1.0 - u[..., 2]
-                out += wx * wy * wz * _hash(i[..., 0] + dx, i[..., 1] + dy, i[..., 2] + dz, seed)
-    return out
+            c0 = vals[perm[perm[hx[0] + iy + dy] + iz + dz]]
+            c1 = vals[perm[perm[hx[1] + iy + dy] + iz + dz]]
+            rows.append(lerp(c0, c1, ux))
+        layers.append(lerp(rows[0], rows[1], uy))
+    return lerp(layers[0], layers[1], uz)
 
 
 def fbm(p, octaves=4, seed=0):
     total = np.zeros(p.shape[:-1], np.float32)
     amp, norm = 0.5, 0.0
     for o in range(octaves):
-        total += amp * value_noise(p * (2.0 ** o), seed + o * 31)
+        total += amp * value_noise(p * (2.0 ** o), seed)
         norm += amp
         amp *= 0.5
     return total / norm
@@ -117,8 +135,6 @@ def smoothstep(e0, e1, x):
 
 def _source(effect, ts):
     t = effect.type
-    if t == "NOISE":
-        return fbm(_positions(ts) * effect.noise_scale, effect.noise_octaves, effect.seed)
     if t == "POSITION":
         return baked(ts, "POSITION")[..., "XYZ".index(effect.axis)]
     curv = baked(ts, "CURVATURE")
@@ -136,19 +152,53 @@ def _source(effect, ts):
     raise ValueError(t)
 
 
+def fbm_fast(pos, scale, octaves, seed):
+    """fBm on the GPU when a GPU context exists, else the numpy implementation."""
+    perm, vals = _table(seed)
+    try:
+        from .engine import noise_gpu
+        return noise_gpu.fbm(pos, scale, octaves, perm, vals)
+    except Exception:  # no GPU context (background mode) or unsupported backend
+        return fbm(pos * scale, octaves, seed)
+
+
+def _noise(effect, ts):
+    key = ("noise", ts.id_data.name, ts.res, _generation, effect.noise_scale,
+           effect.noise_octaves, effect.seed)
+    return _cached(key, lambda: fbm_fast(_positions(ts), effect.noise_scale,
+                                         effect.noise_octaves, effect.seed))
+
+
+def id_selection(id_map, color, tolerance):
+    """1 where the ID colour is within tolerance of `color`, soft at the boundary."""
+    dist = np.linalg.norm(id_map - np.asarray(color, np.float32), axis=-1)
+    return 1.0 - smoothstep(tolerance * 0.5, tolerance, dist)
+
+
 def evaluate(effect, ts):
-    """Generator output as (res, res) float in [0, 1], or None if a bake is missing."""
+    """Generator output as (res, res) float in [0, 1], or None if a bake is missing.
+
+    Noise and sources are cached separately from the final threshold, so dragging
+    Level / Softness / Noise amount only re-runs a cheap smoothstep."""
     if missing(effect, ts):
         return None
+    if effect.type == "ID_MASK":
+        key = ("id", ts.id_data.name, ts.res, _generation, tuple(effect.id_color), effect.id_tolerance)
+        return _cached(key, lambda: id_selection(baked(ts, "ID"), effect.id_color,
+                                                 effect.id_tolerance).astype(np.float32))
+
     key = ("gen", ts.id_data.name, ts.res, _generation, effect.type, effect.level,
            effect.softness, effect.noise_amount, effect.noise_scale, effect.noise_octaves,
            effect.seed, effect.axis)
 
     def compute():
-        v = _source(effect, ts)
-        if effect.type != "NOISE" and effect.noise_amount > 0.0:
-            n = fbm(_positions(ts) * effect.noise_scale, effect.noise_octaves, effect.seed)
-            v = v + (n - 0.5) * effect.noise_amount
+        if effect.type == "NOISE":
+            v = _noise(effect, ts)
+        else:
+            src_key = ("src", ts.id_data.name, ts.res, _generation, effect.type, effect.axis)
+            v = _cached(src_key, lambda: _source(effect, ts))
+            if effect.noise_amount > 0.0:
+                v = v + (_noise(effect, ts) - 0.5) * effect.noise_amount
         t = 1.0 - effect.level
         return smoothstep(t - effect.softness, t + effect.softness, v).astype(np.float32)
     return _cached(key, compute)
