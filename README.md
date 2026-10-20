@@ -18,7 +18,29 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.4)
+## Features (v0.5)
+
+### Phase 5: performance
+Measured with `tests/bench.py` on the same 4-core VM and the same scene: a smart-material folder with generator masks, a grunge fill, a painted layer and a top fill with a Dirt mask. Times are in milliseconds.
+
+| | 1K v0.4 → v0.5 | 2K v0.4 → v0.5 | 4K v0.4 → v0.5 |
+|---|---|---|---|
+| Full composite | 461 → **181** | 2281 → **715** | 14239 → **3330** |
+| Tweak a layer (opacity) | 391 → **89** | 2667 → **344** | 13798 → **1391** |
+| Tweak a channel (colour) | 436 → **24** | 2668 → **85** | 14481 → **345** |
+| Stroke start | 436 → **64** | 2965 → **420** | 12405 → **524** |
+| Stroke update | 341 → **141** | 1603 → **511** | 9359 → **2192** |
+
+Painting on a layer inside a folder was the slowest case in v0.4, at 5.7 s per 2K update. It now takes about 0.5 s.
+
+How:
+- **Region strokes**: the projector works out which texture regions each new dab can touch, from per-triangle screen and UV boxes clustered on a 64×64 grid. Only those regions are read back from the GPU, updated and recomposited. Cached full-resolution layers are sliced, not recomputed
+- **Persistent compositor cache** per texture set, holding decoded pixels, layer entries and masks with a memory budget (set in the add-on preferences). Property edits invalidate only their own layer, and a channel colour edit invalidates only that channel, keeping the mask
+- A **below-checkpoint** stores everything under the most recently edited root layer, so repeated tweaks re-blend only that layer and the ones above it
+- **Cover culling** skips everything under an opaque, unmasked fill. **Sparse blending** blends masked layers only inside their mask's bounding box. Opaque folders composite in place, and blending is in place with no full-resolution temporaries
+- Layer images are written **once per stroke** (not every update) and quantised to their 8-bit precision while painting, so live results, the cache and saved files match exactly
+- `tests/test_phase5.py` checks that every cached, checkpointed, per-channel and region path produces the same result as a from-scratch composite
+
 
 ### Phase 4: smart assets
 - **Smart materials**: 7 built-in (Painted Steel, Rusty Iron, Worn Gold, Dusty Plastic, Concrete, Chrome, Rubber). Each is applied as a folder above the active layer, and its generators re-bind to the target mesh's baked maps
@@ -149,6 +171,8 @@ python tests/demo_phase3.py docs/phase3.png
 python tests/test_phase4.py    # grunge, filters, anchors, built-in + saved smart materials / masks
 python tests/demo_phase4.py docs/smart_materials.png
 python tests/demo_grunge.py docs/grunge.png
+python tests/test_phase5.py    # caches / checkpoints / regions == from-scratch composite
+python tests/bench.py 1024 2048 4096   # timings
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render
 ```

@@ -65,11 +65,39 @@ BAKE_MAPS = [
 ]
 
 
+_LAYER_PATH = None
+
+
+def _owner(prop_group):
+    """(layer uid, channel id) a property group belongs to. uid is None for
+    texture-set props; channel is set only for a layer channel's own props."""
+    global _LAYER_PATH
+    if _LAYER_PATH is None:
+        import re
+        _LAYER_PATH = re.compile(r"paintstack\.layers\[(\d+)\](\.channels\[(\d+)\])?")
+    try:
+        match = _LAYER_PATH.match(prop_group.path_from_id())
+    except ValueError:
+        return None, None
+    if match is None:
+        return None, None
+    layers = prop_group.id_data.paintstack.layers
+    i = int(match.group(1))
+    if i >= len(layers):
+        return None, None
+    channel = None
+    if match.group(3) is not None and isinstance(prop_group, PS_LayerChannel):
+        channel = prop_group.channel
+    return layers[i].uid, channel
+
+
 def _recomposite(self, context):
+    """Property update: invalidate only the owning layer's cached work, then
+    schedule a composite."""
     from . import compositor
     mat = self.id_data
     if isinstance(mat, bpy.types.Material):
-        compositor.request(mat)
+        compositor.request(mat, *_owner(self))
 
 
 class PS_LayerChannel(PropertyGroup):
@@ -237,15 +265,16 @@ def _resolution_changed(self, context):
 
 
 def _view_changed(self, context):
-    from . import material
+    from . import compositor, material
     material.build(self.id_data)
     if self.view_mode == "MASK":
-        _recomposite(self, context)
+        compositor.request_view(self.id_data)
 
 
 def _active_layer_changed(self, context):
     if self.view_mode == "MASK":
-        _recomposite(self, context)
+        from . import compositor
+        compositor.request_view(self.id_data)
 
 
 def _rebuild_material(self, context):

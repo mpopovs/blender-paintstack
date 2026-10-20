@@ -8,10 +8,9 @@ from . import generators, pixels
 FILTERS = {"LEVELS", "BLUR"}
 
 
-def _read(img, overrides):
-    if overrides and img.name in overrides:
-        return overrides[img.name]
-    return pixels.read(img)
+def _read(img, overrides, cache=None, region=None):
+    from .compositor import crop, read
+    return crop(read(img, overrides, cache), region)
 
 
 def box_blur(m, radius, passes=3):
@@ -62,12 +61,13 @@ def anchor_value(effect, cache):
     return generators.smoothstep(t - effect.softness, t + effect.softness, v).astype(np.float32)
 
 
-def effect_value(effect, ts, overrides=None, cache=None):
+def effect_value(effect, ts, overrides=None, cache=None, region=None):
     """(value, alpha) for a non-filter effect, or None if it has nothing to add."""
+    from .compositor import crop
     if effect.type == "PAINT":
         if effect.image is None:
             return None
-        px = _read(effect.image, overrides)
+        px = _read(effect.image, overrides, cache, region)
         return px[..., 0], px[..., 3] * effect.opacity
     if effect.type == "FILL":
         return np.float32(effect.value), effect.opacity
@@ -77,19 +77,23 @@ def effect_value(effect, ts, overrides=None, cache=None):
     v = generators.evaluate(effect, ts)
     if v is None:
         return None
-    return v, effect.opacity
+    return crop(v, region), effect.opacity
 
 
-def evaluate(layer, overrides=None, cache=None):
-    """The layer's final mask as (res, res) float, or None when it has no active mask."""
+def evaluate(layer, overrides=None, cache=None, region=None):
+    """The layer's final mask as a float array (the texture, or just `region`), or
+    None when it has no active mask."""
     if not (layer.has_mask and layer.mask_enabled):
         return None
     ts = layer.id_data.paintstack
-    res = ts.res
+    if region is not None and any(e.enabled and e.type == "BLUR" for e in layer.mask_effects):
+        from .compositor import crop
+        return crop(evaluate(layer, overrides, cache), region)  # blur needs neighbours
     if layer.mask_image is not None:
-        m = _read(layer.mask_image, overrides)[..., 0].copy()
+        m = _read(layer.mask_image, overrides, cache, region)[..., 0].copy()
     else:
-        m = np.ones((res, res), np.float32)
+        from .compositor import region_shape
+        m = np.ones(region_shape(ts, region), np.float32)
 
     for e in layer.mask_effects:
         if not e.enabled:
@@ -100,7 +104,7 @@ def evaluate(layer, overrides=None, cache=None):
                 f = 1.0 - f
             m = blend(m, f, e.opacity, "NORMAL")
             continue
-        ev = effect_value(e, ts, overrides, cache)
+        ev = effect_value(e, ts, overrides, cache, region)
         if ev is None:
             continue
         v, alpha = ev

@@ -277,6 +277,7 @@ class PAINTSTACK_OT_mask_add(Operator):
         mat, ts = texture_set(context)
         add_mask(mat, ts.active_layer, self.white)
         ts.active_layer.edit_target = "MASK"
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -299,6 +300,7 @@ class PAINTSTACK_OT_mask_remove(Operator):
         layer.mask_image = None
         layer.edit_target = "CONTENT"
         undo.clear()
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -458,6 +460,7 @@ class PAINTSTACK_OT_smart_apply(Operator):
         except (KeyError, RuntimeError, OSError) as e:
             self.report({"ERROR"}, f"Could not apply '{self.name}': {e}")
             return {"CANCELLED"}
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -575,6 +578,7 @@ class PAINTSTACK_OT_effect_add(Operator):
         mat, layer = _active_layer(context)
         add_mask_effect(mat, layer, self.type)
         layer.edit_target = "MASK"
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -598,6 +602,7 @@ class PAINTSTACK_OT_effect_remove(Operator):
         layer.mask_effects.remove(layer.active_mask_effect_index)
         layer.active_mask_effect_index = max(0, layer.active_mask_effect_index - 1)
         undo.clear()
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -624,12 +629,14 @@ class PAINTSTACK_OT_effect_move(Operator):
             return {"CANCELLED"}
         layer.mask_effects.move(i, j)
         layer.active_mask_effect_index = j
+        compositor.invalidate(mat, mat.paintstack.active_layer.uid)
         compositor.composite(mat)
         return {"FINISHED"}
 
 
 class PAINTSTACK_OT_composite(Operator):
-    """Re-flatten the layer stack into the material's channel maps"""
+    """Re-flatten the layer stack into the material's channel maps, dropping all
+    cached work (use after editing layer images outside PaintStack)"""
     bl_idname = "paintstack.composite"
     bl_label = "Refresh"
 
@@ -638,7 +645,9 @@ class PAINTSTACK_OT_composite(Operator):
         return texture_set(context)[0] is not None
 
     def execute(self, context):
-        compositor.composite(texture_set(context)[0])
+        mat = texture_set(context)[0]
+        compositor.invalidate(mat)
+        compositor.composite(mat)
         return {"FINISHED"}
 
 

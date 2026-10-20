@@ -6,8 +6,20 @@ from bpy.app.handlers import persistent
 from . import baker, export, ops, paint_mode, picking, props, ui, undo
 from .pixels import PREFIX
 
-_classes = (ops.classes + paint_mode.classes + picking.classes + baker.classes + export.classes
-            + ui.classes)
+class PaintStackPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    cache_budget_mb: bpy.props.IntProperty(
+        name="Compositor Cache (MB)", min=128, max=65536, default=1536,
+        description="Memory kept for decoded layers, entries and masks per texture set. "
+                    "More memory = faster tweaks and strokes on big stacks")
+
+    def draw(self, context):
+        self.layout.prop(self, "cache_budget_mb")
+
+
+_classes = ((PaintStackPreferences,) + ops.classes + paint_mode.classes + picking.classes
+            + baker.classes + export.classes + ui.classes)
 
 
 @persistent
@@ -20,7 +32,9 @@ def _pack_images(_):
 
 @persistent
 def _on_load(_):
+    from . import compositor
     undo.clear()
+    compositor.invalidate_all()
 
 
 def register():

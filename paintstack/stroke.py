@@ -15,11 +15,11 @@ class Target:
     """One image the stroke writes. mode: MASK (opaque grey mask), OVER (RGBA
     content painted over what is there) or ERASE (remove RGBA coverage)."""
 
-    def __init__(self, image, value, mode):
+    def __init__(self, image, value, mode, cache=None):
         self.image = image
         self.value = np.asarray(value, np.float32)
         self.mode = mode
-        self.orig = pixels.read(image)
+        self.orig = compositor.read(image, None, cache)  # shared, never modified
         self.current = self.orig.copy()
 
 
@@ -49,6 +49,8 @@ class Stroke:
 
         from . import ops
         erase = brush.mode == "ERASE"
+        self.full_update = False
+        self.cache = compositor.state(mat).cache
         self.targets = []
         if layer.edit_target == "MASK" or layer.type in ("FILL", "FOLDER", "FILTER"):
             effect = layer.active_mask_effect
@@ -59,11 +61,14 @@ class Stroke:
                 if effect.image is None:
                     ops.ensure_effect_image(mat, layer, effect)
                 v = 0.0 if erase else 1.0
-                self.targets.append(Target(effect.image, (v, v, v), "OVER"))
+                self.targets.append(Target(effect.image, (v, v, v), "OVER", self.cache))
             else:
                 if layer.mask_image is None:
+                    # A new black mask hides the layer everywhere, not just under
+                    # the brush: the first update must recomposite the whole texture.
                     ops.add_mask(mat, layer)
-                self.targets.append(Target(layer.mask_image, 0.0 if erase else 1.0, "MASK"))
+                    self.full_update = True
+                self.targets.append(Target(layer.mask_image, 0.0 if erase else 1.0, "MASK", self.cache))
             layer.edit_target = "MASK"
             self.channels = enabled_channels(ts)
         else:
@@ -74,27 +79,18 @@ class Stroke:
                     continue
                 if lc.image is None:
                     ops.ensure_layer_image(mat, layer, lc)
-                self.targets.append(Target(lc.image, brush.value(ch), "ERASE" if erase else "OVER"))
+                self.targets.append(Target(lc.image, brush.value(ch), "ERASE" if erase else "OVER",
+                                           self.cache))
                 self.channels.append(ch)
 
-        # Everything except the active layer is unchanged during the stroke: its
-        # entries and masks are cached. For a root-level layer the stack below it is
-        # also flattened once, so updates only re-blend the active layer and above.
-        self.cache = {}
+        # Only the touched texture regions are recomposited; every other layer's
+        # entries and masks come from the material's persistent cache.
         self.tree = stack.tree(ts)
-        self.below = None
-        # Anchors make masks depend on other channels' live results: recomposite
-        # everything (in anchor order) on each update instead of caching.
         self.anchors = bool(compositor.anchor_channels(ts))
-        roots = [node[0].uid for node in self.tree]
-        if layer.uid in roots and layer.type in ("PAINT", "FILL") and not self.anchors:
-            i = roots.index(layer.uid)
-            self.above = self.tree[:i]
-            self.below = {ch.id: compositor.composite_nodes(compositor.base_array(ts, ch),
-                                                            self.tree[i + 1:], ch, cache=self.cache)
-                          for ch in self.channels}
+        self.pad = compositor.filter_reach(ts)
+        self.outputs = {}
 
-        undo.push(mat, {t.image.name: t.orig.copy() for t in self.targets})
+        undo.push(mat, {t.image.name: t.orig for t in self.targets})
 
     # Input
 
@@ -156,58 +152,94 @@ class Stroke:
 
     # Output
 
-    def update(self):
-        """Apply the accumulated stroke mask and refresh the composited outputs."""
-        if not self.dirty:
-            return
-        self.dirty = False
-        m = self.projector.read_mask()
-        m = pixels.grow_mask(m, self.coverage, SEAM_GROW) * self.brush.opacity
-
-        overrides = {}
+    def _apply_targets(self, m, region):
+        """Write the stroke mask m (covering region) into every target's current pixels."""
+        y0, y1, x0, x1 = region
         for t in self.targets:
-            o = t.orig
+            o = t.orig[y0:y1, x0:x1]
+            cur = t.current[y0:y1, x0:x1]
             if t.mode == "MASK":
-                val = o[..., :3] + (t.value - o[..., :3]) * m[..., None]
-                t.current = pixels.rgba(val, np.ones_like(m))
+                cur[..., :3] = o[..., :3] + (t.value - o[..., :3]) * m[..., None]
+                cur[..., 3] = 1.0
             elif t.mode == "ERASE":
-                t.current = pixels.rgba(o[..., :3], o[..., 3] * (1.0 - m))
+                cur[..., :3] = o[..., :3]
+                cur[..., 3] = o[..., 3] * (1.0 - m)
             else:
                 # Colour is blended "over" the existing content so coverage and
                 # colour stay consistent (un-premultiplied RGBA).
                 a_new = o[..., 3] + m * (1.0 - o[..., 3])
                 safe = np.maximum(a_new, 1e-6)[..., None]
                 rgb = (t.value * m[..., None] + o[..., :3] * (o[..., 3] * (1.0 - m))[..., None]) / safe
-                t.current = pixels.rgba(np.where(a_new[..., None] > 0, rgb, o[..., :3]), a_new)
-            pixels.write(t.image, t.current)
-            overrides[t.image.name] = t.current
+                cur[..., :3] = np.where(a_new[..., None] > 0, rgb, o[..., :3])
+                cur[..., 3] = a_new
+            if not t.image.is_float:
+                # 8-bit images store 1/255 steps: quantise now so the live outputs,
+                # the cache and the saved image all agree.
+                np.round(cur * 255.0, out=cur)
+                cur /= 255.0
 
-        if self.anchors:
-            # Any channel can depend on the painted one through an anchor mask.
-            results = compositor.composite_all(self.ts, None, overrides)
-            for ch in enabled_channels(self.ts):
-                compositor.write_output(self.ts, ch, results[ch.id])
-            if self.ts.view_mode == "MASK":
-                compositor.write_mask_view(self.mat)
+    def _output(self, ch):
+        """Full RGBA output array, kept for the stroke and pasted into per region."""
+        if ch.id not in self.outputs:
+            self.outputs[ch.id] = pixels.read(self.ts.output(ch.id)).copy()
+        return self.outputs[ch.id]
+
+    def update(self):
+        """Apply the stroke mask in the regions touched since the last update and
+        refresh the composited outputs there."""
+        if not self.dirty:
             return
+        self.dirty = False
+        res = self.ts.res
+        grow = SEAM_GROW + 1
+        regions = self.projector.take_regions(margin=grow)
+        if self.pad is None or self.anchors or self.full_update:
+            regions = [(0, res, 0, res)]  # warp filters / anchors / new masks: whole texture
+            self.full_update = False
+        if not regions:
+            return
+        self._composite_regions(regions)
 
-        # Drop the active layer's cached entries and mask: its images just changed.
-        uid = self.layer.uid
-        for key in [k for k in self.cache if k[1] == uid]:
-            del self.cache[key]
-        for ch in self.channels:
-            if self.below is not None:
-                entry = compositor.layer_entry(self.layer, ch, overrides, self.cache)
-                base = self.below[ch.id]
-                if entry:
-                    base = compositor.mix(base, entry)
-                out = compositor.composite_nodes(base, self.above, ch, overrides, self.cache)
+    def _composite_regions(self, regions):
+        res = self.ts.res
+        grow = SEAM_GROW + 1
+        overrides = {t.image.name: t.current for t in self.targets}
+        channels = enabled_channels(self.ts) if self.anchors else self.channels
+
+        for region in regions:
+            y0, y1, x0, x1 = region
+            # Work on a padded region so filters and seam growth see real neighbours,
+            # then keep only the inner part.
+            p = grow + (self.pad or 0)
+            wy0, wy1, wx0, wx1 = max(0, y0 - p), min(res, y1 + p), max(0, x0 - p), min(res, x1 + p)
+            work = (wy0, wy1, wx0, wx1)
+            m = self.projector.read_mask(work)
+            m = pixels.grow_mask(m, self.coverage[wy0:wy1, wx0:wx1], SEAM_GROW) * self.brush.opacity
+            self._apply_targets(m, work)
+
+            full = work == (0, res, 0, res)
+            if self.anchors:
+                results = compositor.composite_all(self.ts, channels, overrides, self.cache,
+                                                   None if full else work)
             else:
-                out = compositor.composite_nodes(compositor.base_array(self.ts, ch), self.tree, ch,
-                                                 overrides, self.cache)
-            compositor.write_output(self.ts, ch, out)
+                results = {ch.id: compositor.composite_nodes(
+                    compositor.base_array(self.ts, ch, work), self.tree, ch, overrides, self.cache, work)
+                    for ch in channels}
+            iy, ix = slice(y0 - wy0, y1 - wy0), slice(x0 - wx0, x1 - wx0)
+            for ch in channels:
+                self._output(ch)[y0:y1, x0:x1, :3] = compositor.finalize(ch, results[ch.id][iy, ix])
+
+        for ch in channels:
+            pixels.write(self.ts.output(ch.id), self._output(ch))
         if self.ts.view_mode == "MASK":
-            compositor.write_mask_view(self.mat, self.cache)
+            compositor.write_mask_view(self.mat, self.cache, overrides)
 
     def finish(self):
         self.update()
+        # Layer images are written once, at the end of the stroke; the cache keeps
+        # the new pixels so the next composite does not have to read them back.
+        uid = self.layer.uid
+        compositor.invalidate(self.mat, uid)
+        for t in self.targets:
+            pixels.write(t.image, t.current)
+            self.cache[("px", t.image.name)] = t.current

@@ -32,6 +32,7 @@ def _swap(src, dst):
     dst.append((mat_name, current))
     mat = bpy.data.materials.get(mat_name)
     if mat is not None:
+        compositor.invalidate(mat)
         compositor.composite(mat)
     return True
 

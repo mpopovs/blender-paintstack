@@ -31,6 +31,8 @@ def invalidate():
     global _generation
     _generation += 1
     _cache.clear()
+    from . import compositor
+    compositor.invalidate_all()
 
 
 def _cached(key, fn):

@@ -7,7 +7,29 @@
 | 2. Masks and baking | ✅ v0.2.1 | Mesh-map baker (normal high→low, AO, curvature, thickness, position, world normal, ID; cage object; non-blocking); generators (edge wear, dirt, curvature, AO, thickness, position gradient, 3D noise on the GPU); Color Selection from the ID map; a mask stack with paint, fill, levels and blur |
 | 3. Painter UX | ✅ v0.3 | Brush tips (built-in and image) with rotation and jitter, a screen-space stencil, a brush preset library, layer folders, a channel and mask isolation view, a Normal channel with whiteout blending, fill textures (UV and tri-planar), lazy mouse, line strokes |
 | 4. Smart assets | ✅ v0.4 | Built-in and saved smart materials and smart masks (as `.blend` assets in an Asset Browser library), a procedural seamless grunge library, filter layers (blur, sharpen, HSL, warp), anchor points |
-| 5. Performance | next | GPU compositor (keep layers as GPU textures, composite in GLSL), dirty-rectangle updates, tiled 4K/8K and UDIM, an optional C++ extension |
+| 5. Performance | ✅ v0.5 | Region (dirty-rectangle) strokes with partial GPU readback; a persistent compositor cache with per-layer and per-channel invalidation and a memory budget; a below-checkpoint; cover culling; sparse and in-place blending; deferred layer writes. 3–42× faster (see the README) |
+| 6. Scale | next | UDIM texture sets, a GPU compositor, GPU display during strokes, 8K |
+
+## Phase 6 plan
+
+**Why it is not part of Phase 5:**
+- **UDIM** changes the data model: every layer image becomes a tiled image, and the projector, compositor, exports and bakes all need to work per tile. That is a phase of its own, not an optimisation.
+- **A GPU compositor** was planned for Phase 5, but this development environment only has software OpenGL, so its benefit cannot be measured here. Shipping it unmeasured would be guesswork.
+
+The next steps, in order of expected payoff:
+
+1. **GPU display during strokes.** About 100 ms of every 2K stroke update is `Image.pixels.foreach_set` rewriting whole output images, because Blender's Python API has no partial image update. Drawing the stroke regions into GPU textures, with a viewport preview bound to the material, would remove that cost. The CPU images would then be written once, at the end of the stroke.
+2. **A GPU compositor** for full composites and filters: keep decoded layers as GPU textures (the cache becomes VRAM) and blend in GLSL. Generators already run their noise on the GPU.
+3. **UDIM**: a texture set gets a list of tiles. Each tile has its own projector, uses a UV offset, and gets its own region scheduling. Images become `source='TILED'`, and export writes a `<name>.<tile>.png` per tile.
+4. **8K**: float32 numpy arrays need about 1 GB per RGBA image at 8K. That needs float16 storage in the cache, or step 2.
+
+## Known limitations (v0.5)
+
+- About 100 ms of each 2K stroke update writes whole output images, because Blender has no partial update (see Phase 6 step 1).
+- Big strokes cost in proportion to the area they cover. A stroke across half the texture recomposites half the texture.
+- Low-poly meshes with large triangles produce large dab regions, since regions come from triangle UV boxes.
+- Editing a layer image outside PaintStack (Blender's own texture paint) is not detected. Press **Refresh**, which now also drops the cache.
+- Warp filters and anchor masks still force whole-texture stroke updates.
 
 ## Known limitations (v0.4)
 
