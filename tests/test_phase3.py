@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import brushes, compositor, masks, ops, pixels, stack  # noqa: E402
@@ -28,8 +28,7 @@ def override(obj):
 
 
 def setup():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
     # A plane facing the camera: UV space maps linearly onto the screen.
     bpy.ops.mesh.primitive_plane_add(size=2, rotation=(math.pi / 2, 0, 0))
     obj = bpy.context.active_object

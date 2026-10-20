@@ -144,6 +144,9 @@ class State:
         self.cache = OrderedDict()  # ("px", image) / ("entry", uid, ch) / ("mask", uid) / ("anchor", ...)
         self.revs = {}  # uid -> revision, bumped when the layer changes
         self.checkpoint = None  # (root_uid, signature, {channel: base below root})
+        self.gpu_checkpoint = None  # same, with GPU targets
+        self.gpu_results = {}  # channel -> GPU target shown in the viewport, not yet in the CPU image
+        self.gpu_keys = set()
 
 
 _states = {}
@@ -160,6 +163,10 @@ def invalidate(mat, uid=None, channel=None):
     """Forget cached work for one layer (uid) or, with no uid, the whole material.
     With a channel, only that channel's entry is dropped (its mask stays valid)."""
     if uid is None:
+        st = _states.get(mat.name)
+        if st is not None:
+            sync_outputs(mat)
+            _release_gpu(st)
         _states.pop(mat.name, None)
         return
     st = state(mat)
@@ -174,8 +181,28 @@ def invalidate(mat, uid=None, channel=None):
         del st.cache[key]
 
 
+def _release_gpu(st):
+    if st.gpu_checkpoint is None and not st.gpu_results:
+        return
+    from .engine import gpu_compositor
+    gc = gpu_compositor.instance()
+    if st.gpu_checkpoint is not None:
+        for t in st.gpu_checkpoint[2].values():
+            gc.release(t)
+        st.gpu_checkpoint = None
+
+
 def invalidate_all():
+    for name in list(_states):
+        mat = bpy.data.materials.get(name)
+        if mat is not None:
+            sync_outputs(mat)
     _states.clear()
+    try:
+        from .engine import gpu_compositor
+        gpu_compositor.reset()
+    except Exception:
+        pass
 
 
 def _budget_bytes():
@@ -509,22 +536,217 @@ def _checkpointed(mat, changed_uid, cache, channels=None):
             for cid, b in cp[2].items() if cid in wanted}
 
 
+# GPU compositor
+
+BACKEND_OVERRIDE = None  # "GPU" / "CPU" for tests and scripts; otherwise the preference
+FORCE_SYNC = False  # always write CPU images right after a composite (tests)
+DEFER_OVERRIDE = None  # True / False to force the deferred GPU display on or off (tests)
+SYNC_DELAY = 1.0  # seconds of inactivity before deferred GPU results reach the CPU images
+
+
+def _pref(name, default):
+    prefs = bpy.context.preferences.addons.get(__package__)
+    return getattr(prefs.preferences, name, default) if prefs else default
+
+
+def use_gpu(ts):
+    """GPU compositing: requested (or Auto on a hardware GPU), and no anchors."""
+    if anchor_channels(ts):
+        return False
+    mode = BACKEND_OVERRIDE or _pref("compositor_backend", "AUTO")
+    if mode == "CPU":
+        return False
+    if mode == "AUTO" and not hardware.gpu_is_hardware():
+        return False
+    return hardware.gpu_backend() != "NONE"
+
+
+def _deferred():
+    if DEFER_OVERRIDE is not None:
+        return DEFER_OVERRIDE
+    return not (FORCE_SYNC or bpy.app.background) and _pref("gpu_display", True)
+
+
+def _gpu_nodes(gc, base, nodes, ch, cache, keys):
+    """GPU port of composite_nodes: same culling, folder and filter rules."""
+    if nodes:
+        top = next((k for k, (l, _) in enumerate(nodes) if covers(l, ch)), None)
+        if top is not None:
+            nodes = nodes[:top + 1]
+    for layer, children in reversed(nodes):
+        if layer.type in ("FOLDER", "FILTER"):
+            lc = layer.channel(ch.id)
+            if not (layer.visible and (layer.type == "FOLDER" or (lc is not None and lc.enabled))):
+                continue
+            opaque = layer.opacity >= 1.0 and not (layer.has_mask and layer.mask_enabled)
+            if layer.type == "FOLDER" and opaque:
+                base = _gpu_nodes(gc, base, children, ch, cache, keys)
+                continue
+            if layer.type == "FOLDER":
+                inner = _gpu_nodes(gc, gc.copy(base), children, ch, cache, keys)
+                alpha = np.float32(layer.opacity)
+            else:
+                inner = gc.filter(base, layer, ch)
+                alpha = np.float32(layer.opacity * lc.opacity)
+            mask = layer_mask(layer, None, cache)
+            if mask is not None:
+                alpha = mask * alpha
+            key = ("fade", layer.uid, ch.id)
+            keys.add(key)
+            base = gc.fade(base, inner, alpha, key)
+        else:
+            entry = layer_entry(layer, ch, None, cache)
+            if entry:
+                key = ("entry", layer.uid, ch.id)
+                keys.add(key)
+                base = gc.blend(base, entry, key)
+    return base
+
+
+def _gpu_base(gc, ts, ch, keys):
+    """A target holding the channel's starting value (default, or baked normal)."""
+    from . import generators
+    baked = generators.baked(ts, "NORMAL") if ch.id == "NORMAL" else None
+    key = ("base", ch.id, ts.res)
+    keys.add(key)
+
+    def build():
+        arr = base_array(ts, ch)
+        return np.concatenate([arr, np.ones(arr.shape[:2] + (1,), np.float32)], -1)
+    tex = gc.upload(key, [baked], build, "RGBA32F")
+    return gc.run("copy", gc.acquire(ts.res, ts.res), (tex,))
+
+
+def _gpu_composite(mat, channels, changed, cache):
+    """{channel_id: Target} composited on the GPU (the caller owns the targets)."""
+    from . import stack
+    from .engine import gpu_compositor
+    ts = mat.paintstack
+    st = state(mat)
+    gc = gpu_compositor.instance()
+    gc.namespace = mat.name
+    keys = set()
+    nodes = stack.tree(ts)
+    wanted = list(channels or enabled_channels(ts))
+    start = 0
+    cp = None
+    lookup = stack.by_uid(ts)
+    layer = lookup.get(changed) if changed else None
+    if layer is not None:
+        root = ([layer] + stack.ancestors(ts, layer, lookup))[-1]
+        start = next(k for k, (l, _) in enumerate(nodes) if l.uid == root.uid)
+        first = next(k for k, l in enumerate(ts.layers) if l.uid == root.uid)
+        below_layers = list(ts.layers[stack.block_end(ts, first):])
+        sig = (_signature(ts, below_layers), tuple(st.revs.get(l.uid, 0) for l in below_layers))
+        cp = st.gpu_checkpoint
+        if cp is None or cp[0] != root.uid or cp[1] != sig:
+            if cp is not None:
+                for t in cp[2].values():
+                    gc.release(t)
+            bases = {c.id: _gpu_nodes(gc, _gpu_base(gc, ts, c, keys), nodes[start + 1:], c, cache, keys)
+                     for c in enabled_channels(ts)}
+            st.gpu_checkpoint = cp = (root.uid, sig, bases)
+    results = {}
+    for ch in wanted:
+        if cp is not None and ch.id in cp[2]:
+            base = gc.copy(cp[2][ch.id])
+            results[ch.id] = _gpu_nodes(gc, base, nodes[:start + 1], ch, cache, keys)
+        else:
+            results[ch.id] = _gpu_nodes(gc, _gpu_base(gc, ts, ch, keys), nodes, ch, cache, keys)
+    st.gpu_keys = keys
+    return results
+
+
+def sync_outputs(mat):
+    """Write GPU results that so far only reached the viewport into the CPU images."""
+    st = _states.get(mat.name)
+    if not st or not st.gpu_results:
+        return
+    from .engine import gpu_compositor
+    gc = gpu_compositor.instance()
+    ts = mat.paintstack
+    for cid, t in st.gpu_results.items():
+        write_output(ts, BY_ID_[cid], gc.read(t))
+        gc.release(t)
+    st.gpu_results = {}
+
+
+def sync_all():
+    for name in list(_states):
+        mat = bpy.data.materials.get(name)
+        if mat is not None:
+            sync_outputs(mat)
+
+
+_sync_due = 0.0
+
+
+def _idle_sync():
+    import time
+    if time.monotonic() < _sync_due:
+        return _sync_due - time.monotonic()
+    sync_all()
+    return None
+
+
+def _schedule_sync():
+    import time
+    global _sync_due
+    _sync_due = time.monotonic() + SYNC_DELAY
+    if not bpy.app.timers.is_registered(_idle_sync):
+        bpy.app.timers.register(_idle_sync, first_interval=SYNC_DELAY)
+
+
 def composite(mat, channels=None, changed=None):
     """Recomposite and write the outputs. `changed`: uid of the single layer that
-    changed since the last composite, which enables the below-checkpoint."""
+    changed since the last composite, which enables the below-checkpoint.
+
+    On the GPU, results go straight into the viewport's textures; the CPU images
+    follow after SYNC_DELAY seconds of inactivity (and before saving, strokes or
+    whenever sync_outputs is called)."""
     from . import material
     ts = mat.paintstack
     if not ts.initialized:
         return
+    # This composite covers every queued property update of this material (their
+    # cache invalidation already happened when they were queued).
+    _pending.pop(mat.name, None)
     material.ensure_outputs(mat)
     st = state(mat)
     cache = st.cache
     _forget_anchors(cache)
-    results = _checkpointed(mat, changed, cache, channels) if changed else None
-    if results is None:
-        results = composite_all(ts, channels, cache=cache)
-    for cid, rgb in results.items():
-        write_output(ts, BY_ID_[cid], rgb)
+    done = False
+    if use_gpu(ts):
+        try:
+            targets = _gpu_composite(mat, channels, changed, cache)
+            done = True
+        except Exception as e:  # unsupported backend feature: CPU from now on
+            print(f"PaintStack: GPU compositor failed, using the CPU ({e})")
+            global BACKEND_OVERRIDE
+            BACKEND_OVERRIDE = "CPU"
+        if done:
+            from .engine import gpu_compositor
+            gc = gpu_compositor.instance()
+            defer = _deferred()
+            for cid, t in targets.items():
+                old = st.gpu_results.pop(cid, None)
+                gc.release(old)
+                if defer:
+                    gc.to_image(t, ts.output(cid), cid == "NORMAL")
+                    st.gpu_results[cid] = t
+                else:
+                    write_output(ts, BY_ID_[cid], gc.read(t))
+                    gc.release(t)
+            if defer:
+                _schedule_sync()
+            gc.forget_unused(mat.name, st.gpu_keys)
+    if not done:
+        sync_outputs(mat)  # never let older GPU results overwrite a newer CPU composite
+        results = _checkpointed(mat, changed, cache, channels) if changed else None
+        if results is None:
+            results = composite_all(ts, channels, cache=cache)
+        for cid, rgb in results.items():
+            write_output(ts, BY_ID_[cid], rgb)
     if ts.view_mode == "MASK":
         write_mask_view(mat, cache)
     _trim(st, ts)
@@ -555,7 +777,7 @@ def _flush():
 
 
 def _schedule(mat, key):
-    if not _pending:
+    if not bpy.app.timers.is_registered(_flush):
         bpy.app.timers.register(_flush, first_interval=0.05)
     _pending.setdefault(mat.name, set()).add(key)
 

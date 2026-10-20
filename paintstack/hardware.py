@@ -74,6 +74,15 @@ def gpu_name():
         return "unknown"
 
 
+def gpu_is_hardware():
+    """False for software renderers (llvmpipe, SwiftShader...), where the CPU
+    compositor is faster than an emulated GPU."""
+    if gpu_backend() == "NONE":
+        return False
+    name = gpu_name().lower()
+    return not any(s in name for s in ("llvmpipe", "softpipe", "swiftshader", "software"))
+
+
 def pixel_size():
     """Physical pixels per UI pixel (2 on Retina displays)."""
     try:

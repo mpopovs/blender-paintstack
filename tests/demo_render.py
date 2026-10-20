@@ -13,7 +13,7 @@ from mathutils import Vector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor  # noqa: E402
@@ -22,8 +22,7 @@ from paintstack.stroke import Stroke  # noqa: E402
 from test_headless import W, H, front_view  # noqa: E402
 
 out = os.path.abspath(sys.argv[-1] if sys.argv[-1].endswith(".png") else "demo.png")
-bpy.ops.wm.read_factory_settings(use_empty=True)
-paintstack.register()
+fresh_scene()
 bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32)
 obj = bpy.context.active_object
 bpy.ops.object.shade_smooth()

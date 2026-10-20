@@ -524,6 +524,10 @@ class PAINTSTACK_PT_system(PaintStackPanel, Panel):
         col = layout.column(align=True)
         col.label(text=f"{info['gpu_backend']} · {info['gpu']}", icon="SYSTEM")
         col.label(text=f"{info['ram_gb']} GB · {info['threads']} threads · scale {info['pixel_size']:g}")
+        from . import compositor
+        _, ts = ops.texture_set(context)
+        if ts is not None:
+            col.label(text=f"Compositor: {'GPU' if compositor.use_gpu(ts) else 'CPU'}")
         layout.operator("paintstack.diagnostics", icon="CHECKMARK")
 
 

@@ -9,7 +9,8 @@
 | 4. Smart assets | ✅ v0.4 | Built-in and saved smart materials and smart masks (as `.blend` assets in an Asset Browser library), a procedural seamless grunge library, filter layers (blur, sharpen, HSL, warp), anchor points |
 | 5. Performance | ✅ v0.5 | Region (dirty-rectangle) strokes with partial GPU readback; a persistent compositor cache with per-layer and per-channel invalidation and a memory budget; a below-checkpoint; cover culling; sparse and in-place blending; deferred layer writes. 3–42× faster (see the README) |
 | 6. Apple Silicon | ✅ v0.6 | Metal-safe formats, a GPU live stroke preview (regions and mips), multithreaded compositing, unified-memory cache sizing, Retina and Mac input, on-machine diagnostics, a GPU state crash fix |
-| 7. Scale | next | A GPU compositor (prioritised using the Diagnostics timings from an M2), UDIM texture sets, 8K |
+| 7. GPU compositor | ✅ v0.7 | GPU blending, folders and filters checked against the CPU; display without uploads plus idle sync; Auto backend with CPU fallback; a Mac test kit and report |
+| 8. Scale | next | UDIM texture sets, 8K (half-float GPU-resident layers), masks and generators on the GPU, and tuning from the M2 test report |
 
 ## Phase 7 plan (formerly the Phase 6 plan; step 1 shipped in v0.6)
 
@@ -23,6 +24,12 @@ The next steps, in order of expected payoff:
 2. **A GPU compositor** for full composites and filters: keep decoded layers as GPU textures (the cache becomes VRAM) and blend in GLSL. Generators already run their noise on the GPU.
 3. **UDIM**: a texture set gets a list of tiles. Each tile has its own projector, uses a UV offset, and gets its own region scheduling. Images become `source='TILED'`, and export writes a `<name>.<tile>.png` per tile.
 4. **8K**: float32 numpy arrays need about 1 GB per RGBA image at 8K. That needs float16 storage in the cache, or step 2.
+
+## Known limitations (v0.7)
+
+- Masks, generators and layer entries are still prepared on the CPU. They are cached, but the first composite of a large stack, or a change to a mask, does CPU work before the GPU blends.
+- The GPU compositor accumulates in half floats. Viewport and 8-bit outputs are unaffected (within one 8-bit step). Exports always use the full-precision CPU path.
+- Stacks with Anchor masks always use the CPU compositor.
 
 ## Known limitations (v0.6)
 

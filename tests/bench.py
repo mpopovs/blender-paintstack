@@ -16,7 +16,7 @@ import gpu
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor, smart  # noqa: E402
@@ -36,8 +36,7 @@ def timed(fn, repeat=3):
 
 
 def scene(res):
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
     bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32)
     obj = bpy.context.active_object
     bpy.ops.object.shade_smooth()
@@ -91,11 +90,15 @@ def stroke_bench(obj, mat, n_points=40, update_every=4):
     return start, sum(updates) / len(updates), finish
 
 
-def main():
-    sizes = [int(a) for a in sys.argv[1:] if a.isdigit()] or [1024, 2048]
+def main(sizes=None, backend=None):
+    """backend: None (Auto), "CPU", or "GPU" (results shown in the viewport first and
+    synced to the CPU images later, which is what interactive edits do)."""
+    sizes = sizes or [int(a) for a in sys.argv[1:] if a.isdigit()] or [1024, 2048]
     rows = []
     for res in sizes:
         obj, mat = scene(res)
+        compositor.BACKEND_OVERRIDE = backend
+        compositor.DEFER_OVERRIDE = True if backend == "GPU" else None
         ts = mat.paintstack
         compositor.composite(mat)  # warm generator caches
         full = timed(lambda: compositor.composite(mat))
@@ -116,7 +119,9 @@ def main():
         tweak_color()
         twc = timed(tweak_color)
         start, upd, fin = stroke_bench(obj, mat)
-        row = {"res": res, "composite_ms": round(full), "tweak_top_layer_ms": round(tw),
+        compositor.BACKEND_OVERRIDE = compositor.DEFER_OVERRIDE = None
+        row = {"backend": backend or "AUTO", "res": res, "composite_ms": round(full),
+               "tweak_top_layer_ms": round(tw),
                "tweak_color_ms": round(twc),
                "stroke_start_ms": round(start), "stroke_update_ms": round(upd), "stroke_finish_ms": round(fin)}
         rows.append(row)

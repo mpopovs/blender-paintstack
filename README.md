@@ -18,7 +18,15 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.6)
+## Features (v0.7)
+
+### Phase 7: GPU compositor and Mac testing
+- **GPU compositor**: blend modes, pass-through folders, masks and filters (blur, sharpen, HSL, warp) run in GLSL on the GPU (Metal on Apple Silicon). Layer entries and masks are still prepared and cached on the CPU, and uploads are cached by identity, so a tweak only uploads what changed. It is checked against the CPU compositor on every stack type (`tests/test_phase7.py`), with a maximum difference of one 8-bit step
+- **No image uploads while editing**: GPU results go straight into the viewport's textures, including mips. The CPU images follow when you pause for a second, and before saving, painting or exporting
+- **Auto backend selection**: the GPU on a hardware GPU, the CPU on software renderers. Stacks with anchors use the CPU compositor. If the GPU fails, PaintStack switches to the CPU automatically
+- **Mac test kit**: `sh tests/run_on_mac.sh` runs every suite, Diagnostics and the CPU and GPU benchmarks inside your Blender (Metal), and writes `~/Desktop/paintstack_report.txt`. See [docs/MAC.md](docs/MAC.md)
+- Fixed a redundant composite after operators: property updates queued while an operator built layers were composited a second time
+
 
 ### Phase 6: Apple Silicon (MacBook Pro M2) and robustness
 See **[docs/MAC.md](docs/MAC.md)** for the Mac guide.
@@ -158,6 +166,7 @@ paintstack/
   picking.py        eyedropper: ray -> UV -> baked ID colour
   engine/noise_gpu.py  GLSL fBm noise for generators
   engine/live.py    GPU live stroke preview (region + mip writes into image textures)
+  engine/gpu_compositor.py  GPU blending / folders / filters, display into image textures
   hardware.py       Metal / unified memory / performance cores / Retina, thread pool
   diagnostics.py    on-machine GPU self-test and timings
   engine/shaders.py GLSL: depth prepass, UV-space brush dab, UV coverage
@@ -188,6 +197,8 @@ python tests/demo_phase4.py docs/smart_materials.png
 python tests/demo_grunge.py docs/grunge.png
 python tests/test_phase5.py    # caches / checkpoints / regions == from-scratch composite
 python tests/test_phase6.py    # threads, live GPU preview + mips, Retina scale, Metal formats, diagnostics
+python tests/test_phase7.py    # GPU compositor == CPU compositor, deferred display + sync, fallback
+python tests/run_all.py        # everything + diagnostics + benchmark -> one report (also used on the Mac)
 python tests/bench.py 1024 2048 4096   # timings
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render

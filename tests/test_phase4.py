@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor, filters, generators, grunge, masks, pixels, smart  # noqa: E402
@@ -63,8 +63,7 @@ def out(ts, cid):
 
 
 def main():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
 
     # --- Grunge library
     for kind, _, _ in grunge.GRUNGE_TYPES:
@@ -265,9 +264,7 @@ def main():
     check(len(libs) == 1, "PaintStack asset library registered in the preferences")
 
     # Fresh file, different mesh
-    paintstack.unregister()
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
     obj2, mat2 = make_object("sphere")
     ts2 = mat2.paintstack
     with override(obj2):

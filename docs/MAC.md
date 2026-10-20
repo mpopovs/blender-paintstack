@@ -33,3 +33,28 @@ Tips:
 
 ## Reporting performance
 Run **Diagnostics** and copy the timing lines from the report: noise GPU vs CPU, 2K blend with 1 thread vs N threads, and 50 dabs plus region readback. They show what your M2 actually does, and they guide the next optimisation step: moving the full compositor to the GPU.
+
+## Testing PaintStack on your Mac
+The **test kit** (`paintstack-<version>-testkit.zip`) contains the add-on source, all test suites and a runner.
+
+1. Unzip it, for example into `~/Downloads/paintstack-<version>-testkit`.
+2. Open **Terminal** and run:
+   ```sh
+   sh ~/Downloads/paintstack-<version>-testkit/tests/run_on_mac.sh
+   ```
+   If Blender is not at `/Applications/Blender.app`, add its path: `sh …/run_on_mac.sh /path/to/Blender.app`.
+3. A Blender window opens. It may look frozen while the tests run, which takes a few minutes. It closes by itself.
+4. Send back **`~/Desktop/paintstack_report.txt`**. Its first line says `RESULT: ALL PASSED` or how many checks failed. It also contains the Diagnostics (Metal checks) and the CPU and GPU benchmarks.
+
+The run uses `--factory-startup`, so your preferences, installed add-ons and open files are not touched. It loads PaintStack from the test kit, not from your installed copy.
+
+### Manual checklist (things only a person can check)
+Install the add-on zip, open the default cube scene, select the cube, then click **PaintStack → Create Texture Set** and **Start Painting**:
+- [ ] The brush circle has the same on-screen size as Blender's own brushes at the same radius (Retina).
+- [ ] Painting updates the viewport while you drag, with no visible lag spikes at 2K.
+- [ ] **⌘Z** undoes the last stroke and **⌘⇧Z** redoes it (Blender's own undo should not trigger).
+- [ ] **F**, then moving and clicking, resizes the brush.
+- [ ] Two-finger scroll orbits, pinch zooms, and ⇧ + two-finger drag pans, all while in paint mode.
+- [ ] With a pen or Sidecar, **Pressure → Flow** changes stroke strength.
+- [ ] Dragging a layer's **Opacity** slider updates the viewport smoothly. The GPU compositor is in use if **System** shows `Metal` and the preferences say Auto.
+- [ ] Saving, closing and reopening the .blend keeps everything you painted.

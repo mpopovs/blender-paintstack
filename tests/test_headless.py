@@ -16,7 +16,8 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-gpu.init()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor, export, pixels, undo  # noqa: E402
@@ -53,8 +54,7 @@ def center_texel_mask(projector, view, radius=30):
 
 
 def main():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
     bpy.ops.mesh.primitive_uv_sphere_add(segments=48, ring_count=24)
     obj = bpy.context.active_object
     dg = bpy.context.evaluated_depsgraph_get()

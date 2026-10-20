@@ -30,6 +30,7 @@ class Stroke:
         px_scale: physical pixels per UI pixel (2 on Retina); brush sizes are UI pixels.
         live: write stroke regions straight into the viewport's GPU textures
         (None = the add-on preference)."""
+        compositor.sync_outputs(mat)  # strokes start from the CPU images
         self.px_scale = px_scale
         self.live = hardware.live_preview_enabled() if live is None else live
         self.live_channels = set()

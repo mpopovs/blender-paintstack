@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor, diagnostics, hardware, pixels  # noqa: E402
@@ -27,8 +27,7 @@ from test_phase3 import override  # noqa: E402
 
 
 def main():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
 
     # --- Hardware detection
     check(hardware.performance_cores() >= 1 and hardware.threads() >= 1, "core count detected")

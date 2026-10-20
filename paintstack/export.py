@@ -130,6 +130,7 @@ class PAINTSTACK_OT_export(Operator):
 
     def execute(self, context):
         mat, ts = ops.texture_set(context)
+        compositor.sync_outputs(mat)
         directory = bpy.path.abspath(self.directory)
         os.makedirs(directory, exist_ok=True)
         maps = build_maps(ts, self.preset, self.normal_strength / 10.0)

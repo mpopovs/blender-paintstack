@@ -190,6 +190,8 @@ def run():
     threaded = (time.perf_counter() - t) * 1000
     r.info(f"2K blend: 1 thread {single:.0f} ms, {hardware.threads()} threads {threaded:.0f} ms")
 
+    _compositor_checks(r)
+
     proj2 = Projector.from_arrays(pos, nor, uv, 2048)
     proj2.begin_view(*view)
     proj2.clear_mask()
@@ -202,6 +204,66 @@ def run():
 
     r.lines.insert(0, f"PaintStack diagnostics: {r.failures} failure(s)")
     return r
+
+
+def _compositor_checks(r, res=2048):
+    """GPU vs CPU compositor on a temporary texture set (not attached to any object)."""
+    from . import compositor, grunge, ops, pixels
+    from .channels import enabled_channels
+    mat = bpy.data.materials.new("PS_diagnostics")
+    images = []
+    try:
+        ts = mat.paintstack
+        ts.initialized = True
+        ts.resolution = str(res)
+        ops.new_layer(mat, "FILL", "Base")
+        layer = ops.new_layer(mat, "FILL", "Rust")
+        layer.channel("BASE_COLOR").color = (0.5, 0.2, 0.05)
+        layer.channel("BASE_COLOR").texture = grunge.make_image("RUST", 0)
+        ops.add_mask_effect(mat, layer, "GRUNGE")
+        for mode, name in (("MULTIPLY", "Dirt"), ("OVERLAY", "Tint")):
+            l = ops.new_layer(mat, "FILL", name)
+            l.channel("BASE_COLOR").blend_mode = mode
+            l.opacity = 0.6
+            ops.add_mask_effect(mat, l, "NOISE")
+        filt = ops.new_layer(mat, "FILTER", "Blur")
+        filt.filter_type = "BLUR"
+        filt.filter_radius = 2
+
+        def run(backend):
+            compositor.BACKEND_OVERRIDE = backend
+            compositor.FORCE_SYNC = True
+            compositor.invalidate(mat)
+            compositor.composite(mat)  # warm caches and uploads
+            t = time.perf_counter()
+            compositor.composite(mat)
+            ms = (time.perf_counter() - t) * 1000
+            out = {c.id: pixels.read(ts.output(c.id))[..., :3].copy() for c in enabled_channels(ts)}
+            return ms, out
+
+        cpu_ms, cpu = run("CPU")
+        try:
+            gpu_ms, gpu_out = run("GPU")
+        except Exception as e:
+            r.check(False, "GPU compositor runs", str(e)[:200])
+            return
+        fell_back = compositor.BACKEND_OVERRIDE == "CPU"
+        worst = max(float(np.abs(cpu[c] - gpu_out[c]).max()) for c in cpu)
+        r.check(not fell_back and worst <= 1.0 / 255 + 2e-3, "GPU compositor matches the CPU compositor",
+                f"max diff {worst:.4f}")
+        r.info(f"{res}px composite, 5 layers + blur: CPU {cpu_ms:.0f} ms, GPU {gpu_ms:.0f} ms")
+        r.info(f"Auto compositor here: {'GPU' if hardware.gpu_is_hardware() else 'CPU'}")
+    finally:
+        compositor.BACKEND_OVERRIDE = None
+        compositor.FORCE_SYNC = False
+        ts = mat.paintstack
+        images = [o.image for o in ts.outputs if o.image]
+        for l in ts.layers:
+            images += [i for i in (l.mask_image,) if i] + [e.image for e in l.mask_effects if e.image]
+        compositor.invalidate(mat)
+        bpy.data.materials.remove(mat)
+        for img in images:
+            bpy.data.images.remove(img)
 
 
 class PAINTSTACK_OT_diagnostics(Operator):

@@ -14,7 +14,8 @@ import numpy as np
 from mathutils import Vector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-gpu.init()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import compositor, pixels  # noqa: E402
@@ -22,8 +23,7 @@ from paintstack import compositor, pixels  # noqa: E402
 out_dir = os.path.abspath(sys.argv[-1] if os.path.isdir(sys.argv[-1]) else ".")
 RES = 512
 
-bpy.ops.wm.read_factory_settings(use_empty=True)
-paintstack.register()
+fresh_scene()
 bpy.ops.mesh.primitive_monkey_add()
 low = bpy.context.active_object
 bpy.ops.object.shade_smooth()

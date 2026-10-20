@@ -16,6 +16,15 @@ class PaintStackPreferences(bpy.types.AddonPreferences):
     threads: bpy.props.IntProperty(
         name="Threads", min=0, max=64, default=0,
         description="CPU threads for compositing (0 = Auto: the performance cores)")
+    compositor_backend: bpy.props.EnumProperty(
+        name="Compositor",
+        items=[("AUTO", "Auto", "GPU on a hardware GPU (Metal on Apple Silicon), CPU otherwise"),
+               ("GPU", "GPU", "Blend layers on the GPU"),
+               ("CPU", "CPU", "Blend layers on the CPU (multithreaded)")])
+    gpu_display: bpy.props.BoolProperty(
+        name="GPU Display", default=True,
+        description="GPU compositor results go straight to the viewport; the CPU images are "
+                    "updated when you pause for a second, and before saving or painting")
     gpu_live_preview: bpy.props.BoolProperty(
         name="GPU Live Stroke Preview", default=True,
         description="While painting, write stroke regions straight into the viewport's GPU "
@@ -34,6 +43,8 @@ class PaintStackPreferences(bpy.types.AddonPreferences):
         row.prop(self, "cache_budget_mb")
         row.label(text=f"Auto = {info['auto_cache_mb']} MB")
         col.prop(self, "threads")
+        col.prop(self, "compositor_backend")
+        col.prop(self, "gpu_display")
         col.prop(self, "gpu_live_preview")
         layout.operator("paintstack.diagnostics", icon="CHECKMARK")
 
@@ -44,7 +55,10 @@ _classes = ((PaintStackPreferences,) + ops.classes + paint_mode.classes + pickin
 
 @persistent
 def _pack_images(_):
-    """Generated images are lost on save unless packed into the .blend."""
+    """Generated images are lost on save unless packed into the .blend. GPU results
+    that only reached the viewport are written to the images first."""
+    from . import compositor
+    compositor.sync_all()
     for img in bpy.data.images:
         if img.name.startswith(PREFIX) and (img.is_dirty or not img.packed_file):
             img.pack()

@@ -15,7 +15,7 @@ from mathutils import Vector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-gpu.init()
+from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
 import paintstack  # noqa: E402
 from paintstack import baker, generators, masks, picking, pixels  # noqa: E402
@@ -24,8 +24,7 @@ from test_headless import check  # noqa: E402
 
 
 def setup():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    paintstack.register()
+    fresh_scene()
     bpy.ops.mesh.primitive_cube_add(size=2)
     low = bpy.context.active_object
     low.name = "Low"
