@@ -254,18 +254,18 @@ class Stroke:
         if not self.dirty:
             return
         self.dirty = False
-        res = self.ts.res
+        h, w = self.ts.shape
         grow = SEAM_GROW + 1
         regions = self.projector.take_regions(margin=grow)
         if self.pad is None or self.anchors or self.full_update:
-            regions = [(0, res, 0, res)]  # warp filters / anchors / new masks: whole texture
+            regions = [(0, h, 0, w)]  # warp filters / anchors / new masks: whole texture
             self.full_update = False
         if not regions:
             return
         self._composite_regions(regions)
 
     def _composite_regions(self, regions):
-        res = self.ts.res
+        h, w = self.ts.shape
         grow = SEAM_GROW + 1
         overrides = {t.image.name: t.current for t in self.targets}
         channels = enabled_channels(self.ts) if self.anchors else self.channels
@@ -275,13 +275,13 @@ class Stroke:
             # Work on a padded region so filters and seam growth see real neighbours,
             # then keep only the inner part.
             p = grow + (self.pad or 0)
-            wy0, wy1, wx0, wx1 = max(0, y0 - p), min(res, y1 + p), max(0, x0 - p), min(res, x1 + p)
+            wy0, wy1, wx0, wx1 = max(0, y0 - p), min(h, y1 + p), max(0, x0 - p), min(w, x1 + p)
             work = (wy0, wy1, wx0, wx1)
             m = self.projector.read_mask(work)
             m = pixels.grow_mask(m, self.coverage[wy0:wy1, wx0:wx1], SEAM_GROW) * self.brush.opacity
             self._apply_targets(m, work)
 
-            full = work == (0, res, 0, res)
+            full = work == (0, h, 0, w)
             if self.anchors:
                 results = compositor.composite_all(self.ts, channels, overrides, self.cache,
                                                    None if full else work)
@@ -309,10 +309,10 @@ class Stroke:
                     if src is None:
                         # CPU-held output: one upload per region into a scratch
                         # target; conversion and mips then run on the GPU.
-                        src = self.scratch.get(ch.id) or self.scratch.setdefault(ch.id, gc.acquire(res, res))
+                        src = self.scratch.get(ch.id) or self.scratch.setdefault(ch.id, gc.acquire(w, h))
                         self.live_channels.add(ch.id)
                     for region in regions:
-                        block = live.aligned(region, res)
+                        block = live.aligned(region, (h, w))
                         if ch.id not in self.sinks:
                             ay0, ay1, ax0, ax1, _ = block
                             gc.write_region(src, ay0, ax0, self._output(ch)[ay0:ay1, ax0:ax1])

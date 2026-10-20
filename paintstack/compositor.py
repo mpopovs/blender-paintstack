@@ -122,7 +122,7 @@ def crop(arr, region):
 
 def region_shape(ts, region):
     if region is None:
-        return ts.res, ts.res
+        return ts.shape
     return region[1] - region[0], region[3] - region[2]
 
 
@@ -520,7 +520,7 @@ def write_mask_view(mat, cache=None, overrides=None):
     layer = ts.active_layer
     m = layer_mask(layer, overrides, cache) if layer is not None else None
     if m is None:
-        m = np.ones((ts.res, ts.res), np.float32)
+        m = np.ones(ts.shape, np.float32)
     pixels.write(img, pixels.rgba(np.repeat(m[..., None], 3, -1), np.ones_like(m)))
 
 
@@ -559,7 +559,7 @@ def composite_all(ts, channels=None, overrides=None, cache=None, region=None):
 
 def _signature(ts, layers):
     from . import generators
-    return (ts.res, tuple(c.id for c in enabled_channels(ts)), generators._generation,
+    return (ts.size, tuple(c.id for c in enabled_channels(ts)), generators._generation,
             tuple((l.uid, l.parent_uid, l.type) for l in layers))
 
 
@@ -694,14 +694,14 @@ def _gpu_base(gc, ts, ch, keys):
     """A target holding the channel's starting value (default, or baked normal)."""
     from . import generators
     baked = generators.baked(ts, "NORMAL") if ch.id == "NORMAL" else None
-    key = ("base", ch.id, ts.res)
+    key = ("base", ch.id, ts.size)
     keys.add(key)
 
     def build():
         arr = base_array(ts, ch)
         return np.concatenate([arr, np.ones(arr.shape[:2] + (1,), np.float32)], -1)
     tex = gc.upload(key, [baked], build, "RGBA32F")
-    return gc.run("copy", gc.acquire(ts.res, ts.res), (tex,))
+    return gc.run("copy", gc.acquire(*ts.size), (tex,))
 
 
 def _gpu_composite(mat, channels, changed, cache):

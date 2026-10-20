@@ -50,23 +50,28 @@ def hsl(rgb, ch, hue, saturation, lightness):
     return hsv_to_rgb(hsv)
 
 
-def _warp_field(res, scale):
+def _warp_field(h, w, scale):
+    """Seamless displacement field for an (h, w) image: one square tile per UV
+    tile (UDIM images are square tiles side by side), repeated."""
     from . import grunge
+    tile = min(h, w)
 
     def compute():
         period = max(1, int(round(scale)))
-        return np.stack([grunge.tileable_fbm(res, (period, period), 3, 11),
-                         grunge.tileable_fbm(res, (period, period), 3, 23)], -1) - 0.5
-    return generators._cached(("warp", res, round(scale, 3)), compute)
+        f = np.stack([grunge.tileable_fbm(tile, (period, period), 3, 11),
+                      grunge.tileable_fbm(tile, (period, period), 3, 23)], -1) - 0.5
+        return np.ascontiguousarray(np.tile(f, (h // tile, w // tile, 1)))
+    return generators._cached(("warp", h, w, round(scale, 3)), compute)
 
 
 def warp(rgb, amount, scale):
     from .fills import bilinear_wrap
-    res = rgb.shape[0]
-    d = _warp_field(res, scale) * (amount * 0.05)
-    g = (np.arange(res, dtype=np.float32) + 0.5) / res
-    u, v = np.meshgrid(g, g)
-    return bilinear_wrap(rgb, u + d[..., 0], v + d[..., 1])
+    h, w = rgb.shape[:2]
+    d = _warp_field(h, w, scale) * (amount * 0.05)
+    u, v = np.meshgrid((np.arange(w, dtype=np.float32) + 0.5) / w, (np.arange(h, dtype=np.float32) + 0.5) / h)
+    # Displacements are in tile UV units: scale them to the whole image.
+    tile = min(h, w)
+    return bilinear_wrap(rgb, u + d[..., 0] * (tile / w), v + d[..., 1] * (tile / h))
 
 
 def apply(base, layer, ch):

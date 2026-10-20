@@ -1,6 +1,7 @@
 import uuid
 
 import bpy
+import numpy as np
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
@@ -30,20 +31,20 @@ def _image_name(mat, layer, suffix):
 
 def ensure_layer_image(mat, layer, lc):
     ch = next(c for c in CHANNELS if c.id == lc.channel)
-    lc.image = pixels.new_image(_image_name(mat, layer, ch.key), mat.paintstack.res, ch.default,
+    lc.image = pixels.new_image(_image_name(mat, layer, ch.key), mat.paintstack.size, ch.default,
                                 float_buffer=ch.float_buffer, srgb=ch.srgb, alpha=0.0)
     return lc.image
 
 
 def add_mask(mat, layer, white=False):
     v = 1.0 if white else 0.0
-    layer.mask_image = pixels.new_image(_image_name(mat, layer, "mask"), mat.paintstack.res, (v, v, v))
+    layer.mask_image = pixels.new_image(_image_name(mat, layer, "mask"), mat.paintstack.size, (v, v, v))
     return layer.mask_image
 
 
 def ensure_effect_image(mat, layer, effect):
     effect.image = pixels.new_image(_image_name(mat, layer, f"fx{uuid.uuid4().hex[:4]}"),
-                                    mat.paintstack.res, (0.0, 0.0, 0.0), alpha=0.0)
+                                    mat.paintstack.size, (0.0, 0.0, 0.0), alpha=0.0)
     return effect.image
 
 
@@ -114,17 +115,143 @@ def new_layer(mat, kind, name=None, index=None):
     return ts.layers[target]
 
 
-def resize_texture_set(mat):
+def texture_set_images(mat, baked=False):
     ts = mat.paintstack
-    res = ts.res
     imgs = [o.image for o in ts.outputs if o.image]
     for layer in ts.layers:
         imgs += layer_images(layer)
-    for img in imgs:
-        if tuple(img.size) != (res, res):
-            img.scale(res, res)
+    if baked:
+        imgs += [b.image for b in ts.baked if b.image]
+    return imgs
+
+
+def check_size(ts):
+    """Error text if the texture set's images would exceed the GPU's texture limit."""
+    from .props import MAX_ATLAS
+    w, h = ts.size
+    if max(w, h) > MAX_ATLAS:
+        cols, rows = ts.grid
+        return (f"{cols} x {rows} UDIM tiles at {ts.res} make {w} x {h} images, over the "
+                f"{MAX_ATLAS} GPU limit: lower the resolution or the tile count")
+    return None
+
+
+_size_error = None  # last refused resolution / tile change (shown in the panel)
+
+
+def _refuse(ts, attr, applied):
+    """Undo a resolution / tile change that would exceed the GPU texture limit."""
+    global _size_error
+    error = check_size(ts)
+    print(f"PaintStack: {error}")
+    setattr(ts, attr, applied)  # (re-runs the update, which clears _size_error)
+    _size_error = error
+
+
+def resize_texture_set(mat):
+    global _size_error
+    ts = mat.paintstack
+    if check_size(ts):
+        _refuse(ts, "resolution", ts.applied_resolution)
+        return
+    _size_error = None
+    ts.applied_resolution = ts.resolution
+    size = ts.size
+    for img in texture_set_images(mat):
+        if tuple(img.size) != size:
+            img.scale(*size)
     undo.clear()
     compositor.request(mat)
+
+
+def relayout_texture_set(mat):
+    """After the UDIM tile list changed: move every image's existing tiles to their
+    cells in the new layout (tile 1001 stays bottom left). New cells start from the
+    image's typical value (its median), e.g. transparent for paint layers."""
+    global _size_error
+    ts = mat.paintstack
+    if check_size(ts):
+        _refuse(ts, "udim_tiles", ts.applied_tiles)
+        return
+    _size_error = None
+    ts.applied_tiles = ts.udim_tiles
+    old = (ts.layout_cols, ts.layout_rows)
+    new = ts.grid
+    if old == new:
+        compositor.request(mat)
+        return
+    res = ts.res
+    for img in texture_set_images(mat, baked=True):
+        w, h = img.size
+        if (w, h) != (res * old[0], res * old[1]):
+            continue  # not laid out for the old grid (e.g. an imported image)
+        px = pixels.read(img)
+        out = np.empty((res * new[1], res * new[0], 4), np.float32)
+        out[...] = np.median(px.reshape(-1, 4)[::max(1, px.size // 4 // 65536)], 0)
+        ch, cw = min(h, out.shape[0]), min(w, out.shape[1])
+        out[:ch, :cw] = px[:ch, :cw]
+        img.scale(out.shape[1], out.shape[0])
+        pixels.write(img, out)
+    ts.layout_cols, ts.layout_rows = new
+    undo.clear()
+    from . import generators
+    generators.invalidate()
+    compositor.request(mat)
+
+
+def detect_tiles(obj):
+    """UDIM tiles used by the object's active UV map (by face centres)."""
+    me = obj.data
+    uvs = me.uv_layers.active
+    if uvs is None or not me.polygons:
+        return [1001]
+    n = len(me.loops)
+    co = np.empty(n * 2, np.float32)
+    uvs.data.foreach_get("uv", co)
+    co = co.reshape(-1, 2)
+    starts = np.empty(len(me.polygons), np.int32)
+    counts = np.empty(len(me.polygons), np.int32)
+    me.polygons.foreach_get("loop_start", starts)
+    me.polygons.foreach_get("loop_total", counts)
+    centres = np.add.reduceat(co, starts) / counts[:, None]
+    u = np.clip(np.floor(centres[:, 0]), 0, 9).astype(int)
+    v = np.clip(np.floor(centres[:, 1]), 0, 9).astype(int)
+    return sorted({1001 + int(a) + 10 * int(b) for a, b in zip(u, v)})
+
+
+def tiles_text(tiles):
+    """'1001-1004, 1011' style text for a list of tile numbers."""
+    tiles = sorted(tiles)
+    parts, start = [], None
+    for i, t in enumerate(tiles):
+        if start is None:
+            start = t
+        if i + 1 == len(tiles) or tiles[i + 1] != t + 1:
+            parts.append(str(start) if start == t else f"{start}-{t}")
+            start = None
+    return ", ".join(parts)
+
+
+class PAINTSTACK_OT_udim_detect(Operator):
+    """Set the texture set's UDIM tiles to the ones the object's UVs use"""
+    bl_idname = "paintstack.udim_detect"
+    bl_label = "Detect UDIM Tiles"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return texture_set(context)[0] is not None and context.active_object is not None
+
+    def execute(self, context):
+        mat, ts = texture_set(context)
+        tiles = detect_tiles(context.active_object)
+        text = "" if tiles == [1001] else tiles_text(tiles)
+        ts.udim_tiles = text
+        if ts.udim_tiles != text:
+            self.report({"ERROR"}, _size_error or "Tiles not applied")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"UDIM tiles: {text or '1001 (no UDIM)'}")
+        return {"FINISHED"}
 
 
 class PAINTSTACK_OT_init(Operator):
@@ -665,6 +792,7 @@ class PAINTSTACK_OT_undo_stroke(Operator):
 
 classes = (
     PAINTSTACK_OT_init,
+    PAINTSTACK_OT_udim_detect,
     PAINTSTACK_OT_layer_add,
     PAINTSTACK_OT_layer_remove,
     PAINTSTACK_OT_layer_move,

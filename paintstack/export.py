@@ -47,9 +47,8 @@ def gray(maps, cid):
 def build_maps(ts, preset, strength):
     """{suffix: (rgb_or_rgba array, srgb)} for one preset."""
     maps = compositor.composite_all(ts)
-    res = ts.res
-    one = np.ones((res, res), np.float32)
-    zero = np.zeros((res, res), np.float32)
+    one = np.ones(ts.shape, np.float32)
+    zero = np.zeros(ts.shape, np.float32)
     metal = gray(maps, "METALLIC")
     rough = gray(maps, "ROUGHNESS")
     metal = zero if metal is None else metal
@@ -91,6 +90,17 @@ def build_maps(ts, preset, strength):
             out["Occlusion"] = (np.stack([ao] * 3, -1), False)
     if "EMISSION" in maps:
         out["Emission"] = (maps["EMISSION"], True)
+    return out
+
+
+def split_tiles(arr, ts):
+    """[(tile, array)] for each UDIM tile of a texture-set-sized array."""
+    from .props import tile_cell
+    res = ts.res
+    out = []
+    for tile in ts.tiles:
+        c, r = tile_cell(tile)
+        out.append((tile, arr[r * res:(r + 1) * res, c * res:(c + 1) * res]))
     return out
 
 
@@ -146,11 +156,21 @@ class PAINTSTACK_OT_export(Operator):
                 self.report({"WARNING"}, f"Edge padding skipped: {e}")
 
         base = bpy.path.clean_name(mat.name)
+        tiles = ts.tiles
+        udim = ts.grid != (1, 1) or tiles != [1001]
+        files = 0
         for suffix, (arr, srgb) in maps.items():
             if coverage is not None:
                 arr = pixels.dilate(arr, coverage, self.padding)
-            save_png(os.path.join(directory, f"{base}_{suffix}.png"), arr, srgb)
-        self.report({"INFO"}, f"Exported {len(maps)} maps to {directory}")
+            if not udim:
+                save_png(os.path.join(directory, f"{base}_{suffix}.png"), arr, srgb)
+                files += 1
+                continue
+            # UDIM: one <name>.<tile>.png per tile, the naming every DCC and engine reads.
+            for tile, part in split_tiles(arr, ts):
+                save_png(os.path.join(directory, f"{base}_{suffix}.{tile}.png"), part, srgb)
+                files += 1
+        self.report({"INFO"}, f"Exported {files} files ({len(maps)} maps) to {directory}")
         return {"FINISHED"}
 
 

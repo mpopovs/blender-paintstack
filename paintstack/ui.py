@@ -163,6 +163,15 @@ class PAINTSTACK_PT_main(PaintStackPanel, Panel):
         ts = mat.paintstack
         layout.label(text=f"Texture Set: {mat.name}", icon="MATERIAL")
         layout.prop(ts, "resolution")
+        row = layout.row(align=True)
+        row.prop(ts, "udim_tiles", text="UDIM")
+        row.operator("paintstack.udim_detect", text="", icon="UV")
+        cols, rows = ts.grid
+        if (cols, rows) != (1, 1):
+            w, h = ts.size
+            layout.label(text=f"{len(ts.tiles)} tiles, images {w} x {h}", icon="IMAGE_DATA")
+        if ops._size_error:
+            layout.label(text=ops._size_error, icon="ERROR")
         col = layout.column(heading="Channels", align=True)
         for ch in ("base_color", "metallic", "roughness", "height", "normal", "emission"):
             col.prop(ts, "use_" + ch)

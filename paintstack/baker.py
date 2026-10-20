@@ -20,12 +20,12 @@ def baked_image(mat, map_type):
     ts = mat.paintstack
     img = ts.baked_map(map_type)
     if img is not None:
-        if tuple(img.size) != (ts.res, ts.res):
-            img.scale(ts.res, ts.res)
+        if tuple(img.size) != ts.size:
+            img.scale(*ts.size)
         return img
     entry = ts.baked.add()
     entry.map_type = map_type
-    entry.image = pixels.new_image(f"{mat.name}_bake_{map_type.lower()}", ts.res, (0.0, 0.0, 0.0),
+    entry.image = pixels.new_image(f"{mat.name}_bake_{map_type.lower()}", ts.size, (0.0, 0.0, 0.0),
                                    float_buffer=True)
     return entry.image
 
@@ -128,9 +128,11 @@ class _BakeEnvironment:
     """Temporarily swaps materials, selection, visibility and render settings,
     and puts everything back afterwards."""
 
-    def __init__(self, context, low, high, cage=None):
+    def __init__(self, context, low, high, cage=None, grid=(1, 1)):
         self.context, self.low, self.high, self.cage = context, low, high, cage
         self.slots, self.appended, self.temp_mats = [], [], []
+        self.grid = grid
+        self.uv = None  # (previous active UV layer name, temporary atlas UV layer name)
 
     def __enter__(self):
         ctx = self.context
@@ -153,7 +155,26 @@ class _BakeEnvironment:
             if o:
                 o.select_set(True)
         vl.objects.active = self.low
+        if self.grid != (1, 1):
+            self._atlas_uvs()
         return self
+
+    def _atlas_uvs(self):
+        """UDIM: bake through a temporary UV map scaled into the tile layout of the
+        texture set's images (u / columns, v / rows), the active one while baking."""
+        uvs = self.low.data.uv_layers
+        src = uvs.active
+        if src is None:
+            return
+        n = len(src.data)
+        co = np.empty(n * 2, np.float32)
+        src.data.foreach_get("uv", co)
+        co = (co.reshape(-1, 2) / np.array(self.grid, np.float32)).ravel()
+        prev = src.name
+        tmp = uvs.new(name="PS_bake_atlas", do_init=False)
+        tmp.data.foreach_set("uv", co)
+        uvs.active = tmp
+        self.uv = (prev, tmp.name)
 
     def assign(self, obj, choose):
         """Override every material slot of obj with choose(original_material)."""
@@ -182,6 +203,14 @@ class _BakeEnvironment:
 
     def __exit__(self, *exc):
         self.release_slots()
+        if self.uv is not None:
+            uvs = self.low.data.uv_layers
+            prev, tmp = self.uv
+            if prev in uvs:
+                uvs.active = uvs[prev]
+            if tmp in uvs:
+                uvs.remove(uvs[tmp])
+            self.uv = None
         scene, vl = self.context.scene, self.context.view_layer
         scene.render.engine, scene.cycles.samples, scene.cycles.device = self.render
         for o, hidden, hv, hr, hs in self.vis:
@@ -257,7 +286,7 @@ class BakeJob:
 
     def start(self):
         self.dummy = bpy.data.images.new("PS_bake_dummy", 8, 8, float_buffer=True)
-        self.env = _BakeEnvironment(self.context, self.low, self.high, self.cage).__enter__()
+        self.env = _BakeEnvironment(self.context, self.low, self.high, self.cage, self.ts.grid).__enter__()
 
     def step(self):
         """Bake the next map. Returns True while more maps remain."""

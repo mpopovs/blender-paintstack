@@ -17,7 +17,7 @@ def ensure_outputs(mat):
             continue
         out = ts.outputs.add()
         out.channel = ch.id
-        out.image = pixels.new_image(f"{mat.name}_{ch.label.replace(' ', '')}", ts.res, ch.default,
+        out.image = pixels.new_image(f"{mat.name}_{ch.label.replace(' ', '')}", ts.size, ch.default,
                                      float_buffer=ch.float_buffer, srgb=ch.srgb)
 
 
@@ -41,11 +41,7 @@ def _unlink(nt, socket):
 
 
 def _multiply_ao(nt, color_out, ao_image, location):
-    ao = nt.nodes.new("ShaderNodeTexImage")
-    ao.name = ao.label = NODE_PREFIX + "Baked AO"
-    ao.image = ao_image
-    ao.location = (location[0] - 300, location[1] - 60)
-    ao.hide = True
+    ao = _image_node(nt, "Baked AO", ao_image, (location[0] - 300, location[1] - 60))
     mix = nt.nodes.new("ShaderNodeMix")
     mix.name = NODE_PREFIX + "AO Multiply"
     mix.data_type = "RGBA"
@@ -63,10 +59,30 @@ def mask_view_image(mat):
     name = f"{pixels.PREFIX}{mat.name}_maskview"
     img = bpy.data.images.get(name)
     if img is None:
-        img = pixels.new_image(f"{mat.name}_maskview", ts.res, (1.0, 1.0, 1.0))
-    elif tuple(img.size) != (ts.res, ts.res):
-        img.scale(ts.res, ts.res)
+        img = pixels.new_image(f"{mat.name}_maskview", ts.size, (1.0, 1.0, 1.0))
+    elif tuple(img.size) != ts.size:
+        img.scale(*ts.size)
     return img
+
+
+_atlas_uv = None  # UV socket mapped to the UDIM layout while building (None: plain UVs)
+
+
+def _atlas_mapping(nt, ts, location):
+    """UDIM: every PaintStack image holds the tiles side by side like UV space, so
+    sample them at (u / columns, v / rows)."""
+    cols, rows = ts.grid
+    if (cols, rows) == (1, 1):
+        return None
+    coord = nt.nodes.new("ShaderNodeTexCoord")
+    coord.name = NODE_PREFIX + "UV"
+    coord.location = (location[0] - 400, location[1])
+    mapping = nt.nodes.new("ShaderNodeMapping")
+    mapping.name = NODE_PREFIX + "UDIM Layout"
+    mapping.location = (location[0] - 200, location[1])
+    mapping.inputs["Scale"].default_value = (1.0 / cols, 1.0 / rows, 1.0)
+    nt.links.new(coord.outputs["UV"], mapping.inputs["Vector"])
+    return mapping.outputs["Vector"]
 
 
 def _image_node(nt, label, image, location):
@@ -75,6 +91,9 @@ def _image_node(nt, label, image, location):
     tex.image = image
     tex.location = location
     tex.hide = True
+    if _atlas_uv is not None:
+        tex.extension = "EXTEND"  # no wrapping from one edge of the layout to the other
+        nt.links.new(_atlas_uv, tex.inputs["Vector"])
     return tex
 
 
@@ -90,6 +109,16 @@ def build(mat):
             nt.nodes.remove(n)
     bsdf = _principled(nt)
     x, y = bsdf.location.x - 600, bsdf.location.y + 300
+    global _atlas_uv
+    _atlas_uv = _atlas_mapping(nt, ts, (x - 300, y + 150))
+    try:
+        _build(mat, nt, bsdf, x, y)
+    finally:
+        _atlas_uv = None
+
+
+def _build(mat, nt, bsdf, x, y):
+    ts = mat.paintstack
     enabled = {c.id for c in enabled_channels(ts)}
 
     # Normal: the Normal channel (which already contains the baked normal), or the

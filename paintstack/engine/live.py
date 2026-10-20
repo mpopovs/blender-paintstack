@@ -86,19 +86,20 @@ def srgb_to_linear(c):
 LIVE_MIPS = 7
 
 
-def aligned(region, res):
+def aligned(region, shape):
     """Region grown so every live mip level's block starts and ends on whole
-    texels: (y0, y1, x0, x1, levels)."""
+    texels: (y0, y1, x0, x1, levels). shape: the image's (height, width)."""
     y0, y1, x0, x1 = region
-    levels = min(LIVE_MIPS, int(np.log2(res)) + 1)
+    h, w = shape
+    levels = min(LIVE_MIPS, int(np.log2(min(h, w))) + 1)
     f = 1 << (levels - 1)
-    return ((y0 // f) * f, min(res, -(-y1 // f) * f), (x0 // f) * f, min(res, -(-x1 // f) * f), levels)
+    return ((y0 // f) * f, min(h, -(-y1 // f) * f), (x0 // f) * f, min(w, -(-x1 // f) * f), levels)
 
 
 def push(image, rgba, region):
     """Write region (y0, y1, x0, x1) of a full-resolution RGBA array (the image's
     stored values) into the image's GPU texture and its first mip levels."""
-    ay0, ay1, ax0, ax1, levels = aligned(region, rgba.shape[0])
+    ay0, ay1, ax0, ax1, levels = aligned(region, rgba.shape[:2])
     push_block(image, rgba[ay0:ay1, ax0:ax1], ay0, ax0, levels)
 
 

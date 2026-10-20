@@ -80,7 +80,7 @@ def _dab_debug(r, proj, view, ref):
                              samplers=[(0, "depthTex"), (1, "tipTex"), (2, "stencilTex")], view_ubo=True)
         proj.begin_view(*view)
         proj.set_tip(None)
-        res = proj.res
+        res = proj.size[0]
         off = gpu.types.GPUOffScreen(res, res, format="RGBA32F")
         try:
             with off.bind():

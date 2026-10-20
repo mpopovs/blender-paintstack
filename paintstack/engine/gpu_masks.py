@@ -124,17 +124,17 @@ def _noise(gc, ts, effect, keys):
     from .. import generators
     from . import noise_gpu
     pos = generators._positions(ts)
-    key = ("noise", ts.res, generators._generation, round(effect.noise_scale, 6),
+    key = ("noise", ts.size, generators._generation, round(effect.noise_scale, 6),
            effect.noise_octaves, effect.seed)
     keys.add(key)
 
     def make():
-        pos_tex = gc.upload(("positions", ts.res, generators._generation), [pos],
+        pos_tex = gc.upload(("positions", ts.size, generators._generation), [pos],
                             lambda: np.concatenate([pos, np.ones(pos.shape[:2] + (1,), np.float32)], -1),
                             "RGBA32F")
-        keys.add(("positions", ts.res, generators._generation))
+        keys.add(("positions", ts.size, generators._generation))
         perm, vals = generators._table(effect.seed)
-        return noise_gpu.fbm_target(gc, pos_tex, ts.res, effect.noise_scale, effect.noise_octaves, perm, vals)
+        return noise_gpu.fbm_target(gc, pos_tex, ts.size, effect.noise_scale, effect.noise_octaves, perm, vals)
     return gc.memo(key, [pos], make)
 
 
@@ -145,7 +145,7 @@ def _generator(gc, m, effect, ts, keys):
     t = 1.0 - effect.level
     if effect.type == "ID_MASK":
         idm = generators.baked(ts, "ID")
-        key = ("idmap", ts.res, generators._generation)
+        key = ("idmap", ts.size, generators._generation)
         keys.add(key)
         tex = gc.upload(key, [idm], lambda: np.concatenate(
             [idm, np.ones(idm.shape[:2] + (1,), np.float32)], -1), "RGBA32F")
@@ -154,7 +154,7 @@ def _generator(gc, m, effect, ts, keys):
     if effect.type == "NOISE":
         return _pass(gc, m, 3, effect.opacity, effect.blend_mode, effect.invert,
                      noise=_noise(gc, ts, effect, keys).tex, params2=(t, effect.softness, 0.0, 0.0))
-    src_key = ("src", ts.id_data.name, ts.res, generators._generation, effect.type, effect.axis,
+    src_key = ("src", ts.id_data.name, ts.size, generators._generation, effect.type, effect.axis,
                effect.grunge, effect.grunge_tiling, effect.seed if effect.type == "GRUNGE" else 0)
     src = generators._cached(src_key, lambda: generators._source(effect, ts))
     key = ("gsrc",) + src_key[1:]
@@ -172,8 +172,7 @@ def evaluate(gc, layer, cache, keys):
     if not (layer.has_mask and layer.mask_enabled):
         return None
     ts = layer.id_data.paintstack
-    res = ts.res
-    m = gc.acquire(res, res)
+    m = gc.acquire(*ts.size)
     with m.fb.bind():  # pooled targets hold old data: start from a defined value
         gpu.state.active_framebuffer_get().clear(color=(1.0, 1.0, 1.0, 1.0))
     if layer.mask_image is not None:

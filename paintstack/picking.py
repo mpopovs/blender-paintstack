@@ -39,11 +39,16 @@ def uv_at_ray(obj, depsgraph, origin, direction):
         eval_obj.to_mesh_clear()
 
 
-def sample(img, uv):
+def sample(img, uv, grid=(1, 1)):
+    """Colour of a texture-set image at a mesh UV. grid: the texture set's UDIM
+    (columns, rows); images hold the tiles side by side (see PS_TextureSet.size)."""
     px = pixels.read(img)
     h, w = px.shape[:2]
-    x = int(np.clip(uv[0] % 1.0 * w, 0, w - 1))
-    y = int(np.clip(uv[1] % 1.0 * h, 0, h - 1))
+    cols, rows = grid
+    u = uv[0] / cols if cols > 1 else uv[0] % 1.0
+    v = uv[1] / rows if rows > 1 else uv[1] % 1.0
+    x = int(np.clip(u * w, 0, w - 1))
+    y = int(np.clip(v * h, 0, h - 1))
     return tuple(float(c) for c in px[y, x, :3])
 
 
@@ -100,7 +105,7 @@ class PAINTSTACK_OT_id_pick(Operator):
         if uv is None:
             self.report({"INFO"}, "Missed the model")
             return {"RUNNING_MODAL"}
-        effect.id_color = sample(ts.baked_map("ID"), uv)
+        effect.id_color = sample(ts.baked_map("ID"), uv, ts.grid)
         self.area.tag_redraw()
         return self._end(context, {"FINISHED"})
 

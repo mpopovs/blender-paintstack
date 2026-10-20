@@ -19,8 +19,10 @@ def write(img, arr):
     img.update()
 
 
-def new_image(name, res, color, *, float_buffer=False, srgb=False, alpha=1.0):
-    img = bpy.data.images.new(PREFIX + name, res, res, alpha=True, float_buffer=float_buffer)
+def new_image(name, size, color, *, float_buffer=False, srgb=False, alpha=1.0):
+    """size: texels per side, or (width, height)."""
+    w, h = (size, size) if isinstance(size, int) else size
+    img = bpy.data.images.new(PREFIX + name, w, h, alpha=True, float_buffer=float_buffer)
     img.colorspace_settings.name = "sRGB" if srgb else "Non-Color"
     img.generated_color = (*color[:3], alpha)
     return img

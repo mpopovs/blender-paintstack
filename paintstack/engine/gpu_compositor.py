@@ -171,7 +171,7 @@ void main()
 {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 size = textureSize(baseTex, 0);
-  vec2 d = texelFetch(fieldTex, p, 0).rg * params.x;
+  vec2 d = texelFetch(fieldTex, p, 0).rg * params.x * params.yz;  /* tile units -> image */
   vec2 uv = (vec2(p) + 0.5) / vec2(size) + d;
   vec2 x = (uv - floor(uv)) * vec2(size) - 0.5;
   vec2 x0 = floor(x);
@@ -429,11 +429,13 @@ class GPUCompositor:
                            params2=(kind, 0.0, 0.0, 0.0))
         if t == "WARP":
             from .. import filters
-            field = filters._warp_field(base.w, layer.warp_scale)
-            ftex = self.upload(("warp", base.w, round(layer.warp_scale, 3)), [field],
+            field = filters._warp_field(base.h, base.w, layer.warp_scale)
+            ftex = self.upload(("warp", base.h, base.w, round(layer.warp_scale, 3)), [field],
                                lambda: np.concatenate([field, np.zeros(field.shape[:2] + (2,), np.float32)], -1),
                                "RGBA32F")
-            return self.op("warp", size, (base.tex, ftex), params=(layer.filter_amount * 0.05, 0.0, 0.0, 0.0))
+            tile = min(base.w, base.h)
+            return self.op("warp", size, (base.tex, ftex),
+                           params=(layer.filter_amount * 0.05, tile / base.w, tile / base.h, 0.0))
         return self.copy(base)
 
     # Output for display

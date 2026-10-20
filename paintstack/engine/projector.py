@@ -55,11 +55,13 @@ def mesh_arrays(obj, depsgraph, material):
             np.ascontiguousarray(uv.reshape(-1, 2)[tris], np.float32))
 
 
-def cells_to_regions(occ, res, margin=0):
+def cells_to_regions(occ, size, margin=0):
     """Bounding rectangles (y0, y1, x0, x1) in texels of the 8-connected clusters of
-    True cells in a coarse occupancy grid covering the texture."""
+    True cells in a coarse occupancy grid covering the texture. size: texels per
+    side, or (width, height)."""
+    w, h = (size, size) if isinstance(size, int) else size
     cells = occ.shape[0]
-    cell = res / cells
+    cell_w, cell_h = w / cells, h / cells
     regions = []
     seen = np.zeros_like(occ)
     for cy, cx in zip(*np.nonzero(occ)):
@@ -76,8 +78,8 @@ def cells_to_regions(occ, res, margin=0):
                     if 0 <= ny < cells and 0 <= nx < cells and occ[ny, nx] and not seen[ny, nx]:
                         seen[ny, nx] = True
                         stack.append((ny, nx))
-        regions.append((max(0, int(min(ys) * cell) - margin), min(res, int((max(ys) + 1) * cell) + margin),
-                        max(0, int(min(xs) * cell) - margin), min(res, int((max(xs) + 1) * cell) + margin)))
+        regions.append((max(0, int(min(ys) * cell_h) - margin), min(h, int((max(ys) + 1) * cell_h) + margin),
+                        max(0, int(min(xs) * cell_w) - margin), min(w, int((max(xs) + 1) * cell_w) + margin)))
     return regions
 
 
@@ -134,26 +136,32 @@ def read_texture(tex, channels=1):
 
 class Projector:
     def __init__(self, obj, depsgraph, material, res):
+        """res: texels per UV tile. With UDIM tiles the stroke mask covers the
+        texture set's whole tile layout (UVs are mapped to it like the images)."""
         pos, nor, uv = mesh_arrays(obj, depsgraph, material)
-        self._setup(pos, nor, uv, res, self.make_key(obj, material, res))
+        cols, rows = material.paintstack.grid
+        if (cols, rows) != (1, 1):
+            uv = np.ascontiguousarray(uv / np.array([cols, rows], np.float32))
+        self._setup(pos, nor, uv, (res * cols, res * rows), self.make_key(obj, material, res))
 
     @classmethod
     def from_arrays(cls, pos, nor, uv, res):
         """Projector for raw per-corner arrays (used by diagnostics and tests)."""
         p = cls.__new__(cls)
         p._setup(np.ascontiguousarray(pos, np.float32), np.ascontiguousarray(nor, np.float32),
-                 np.ascontiguousarray(uv, np.float32), res, None)
+                 np.ascontiguousarray(uv, np.float32), (res, res), None)
         return p
 
-    def _setup(self, pos, nor, uv, res, key):
-        self.res = res
+    def _setup(self, pos, nor, uv, size, key):
+        self.size = size  # (width, height) of the stroke mask = the texture set's images
+        self.res = size[0]
         self.key = key
         self.depth_batch = batch_for_shader(shaders.depth_shader(), "TRIS", {"pos": pos})
         self.uv_batch = batch_for_shader(shaders.dab_shader(), "TRIS",
                                          {"pos": pos, "uv": uv, "nor": nor})
         # Half float: blendable on every Metal GPU (32-bit float blending is not
         # guaranteed), and half the readback bandwidth.
-        self.mask = gpu.types.GPUOffScreen(res, res, format="RGBA16F")
+        self.mask = gpu.types.GPUOffScreen(*size, format="RGBA16F")
         self.depth = None
         self.view = None
         self._coverage = None
@@ -169,7 +177,7 @@ class Projector:
 
     @staticmethod
     def make_key(obj, material, res):
-        return (obj.name, material.name, res, tuple(map(tuple, obj.matrix_world)),
+        return (obj.name, material.name, res, material.paintstack.grid, tuple(map(tuple, obj.matrix_world)),
                 len(obj.data.vertices), len(obj.data.polygons))
 
     def free(self):
@@ -243,7 +251,6 @@ class Projector:
         hit &= self._tri_ok
         if not hit.any():
             return []
-        res = self.res
         cells = 64
         x0 = np.clip(np.floor(self._tri_uv_min[hit, 0] * cells), 0, cells - 1).astype(np.int64)
         y0 = np.clip(np.floor(self._tri_uv_min[hit, 1] * cells), 0, cells - 1).astype(np.int64)
@@ -256,7 +263,7 @@ class Projector:
         np.add.at(diff, (y1 + 1, x0), -1)
         np.add.at(diff, (y1 + 1, x1 + 1), 1)
         occ = diff.cumsum(0).cumsum(1)[:cells, :cells] > 0
-        return cells_to_regions(occ, res, margin)
+        return cells_to_regions(occ, self.size, margin)
 
     def take_regions(self, margin=0):
         """Regions touched by the dabs since the last call (see regions_for)."""
@@ -353,7 +360,7 @@ class Projector:
     def coverage(self):
         """Boolean (res, res) map of texels covered by the mesh's UV islands."""
         if self._coverage is None:
-            off = gpu.types.GPUOffScreen(self.res, self.res, format="RGBA8")
+            off = gpu.types.GPUOffScreen(*self.size, format="RGBA8")
             try:
                 with off.bind():
                     gpu.state.active_framebuffer_get().clear(color=(0.0, 0.0, 0.0, 0.0))

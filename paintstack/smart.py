@@ -219,11 +219,11 @@ def copy_layers(src_ts, src_indices, dst_mat, index, copy_images):
             for e in layer.mask_effects:
                 if e.image:
                     e.image = pixels.clone_image(e.image)
-        res = dst.res
+        size = dst.size
         for img in layer_images(layer):
-            if img.name.startswith(pixels.PREFIX) and tuple(img.size) != (res, res) \
+            if img.name.startswith(pixels.PREFIX) and tuple(img.size) != size \
                     and "Grunge_" not in img.name:
-                img.scale(res, res)
+                img.scale(*size)
         # Record the uid before moving: after move() the reference points at whatever
         # item now occupies the old slot.
         new_uids.append(layer.uid)

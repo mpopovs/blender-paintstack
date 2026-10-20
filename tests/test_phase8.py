@@ -165,6 +165,169 @@ def gpu_mask_checks():
     print(f"worst GPU mask difference {worst[0]:.4f} ({worst[1]})")
 
 
+def udim_plane():
+    """Two quads facing the camera: the left one in UDIM tile 1001, the right one
+    in 1002. World x = 2u - 2 and z = 2v - 1 across both."""
+    me = bpy.data.meshes.new("UDIMPlane")
+    verts = [(-2, 0, -1), (0, 0, -1), (0, 0, 1), (-2, 0, 1), (2, 0, -1), (2, 0, 1)]
+    me.from_pydata(verts, [], [(0, 1, 2, 3), (1, 4, 5, 2)])
+    uv = me.uv_layers.new(name="UVMap")
+    coords = [(0, 0), (1, 0), (1, 1), (0, 1), (1, 0), (2, 0), (2, 1), (1, 1)]
+    for loop, c in zip(uv.data, coords):
+        loop.uv = c
+    obj = bpy.data.objects.new("UDIMPlane", me)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    return obj
+
+
+def udim_checks():
+    import tempfile
+    from paintstack import export, ops, pixels as px_mod
+    fresh_scene()
+    obj = udim_plane()
+    with override(obj):
+        bpy.ops.paintstack.init()
+    mat = obj.active_material
+    ts = mat.paintstack
+    ts.resolution = "256"
+    # Paint something before switching to UDIM: it must stay in tile 1001.
+    with override(obj):
+        bpy.ops.paintstack.layer_add(type="PAINT")
+    layer = ts.active_layer
+    lc = layer.channel("BASE_COLOR")
+    ops.ensure_layer_image(mat, layer, lc)
+    before = np.random.default_rng(5).random((256, 256, 4)).astype(np.float32)
+    px_mod.write(lc.image, before)
+
+    with override(obj):
+        check(bpy.ops.paintstack.udim_detect() == {"FINISHED"}, "detect UDIM tiles")
+    check(ts.tiles == [1001, 1002] and ts.grid == (2, 1), f"tiles {ts.tiles}, grid {ts.grid}")
+    check(tuple(lc.image.size) == (512, 256) and tuple(ts.output("BASE_COLOR").size) == (512, 256),
+          "images re-laid out to 2 tiles side by side")
+    after = px_mod.read(lc.image)
+    check(np.abs(after[:, :256] - before).max() < 1.0 / 255 + 1e-6, "tile 1001 content kept in place")
+    check(np.allclose(after[:, 256:], after[0, 256]), "new tile starts uniform")
+    ts.layers.remove(ts.active_layer_index)
+
+    # Projection across the tile border
+    proj = Projector(obj, bpy.context.evaluated_depsgraph_get(), mat, ts.res)
+    check(proj.size == (512, 256), "stroke mask covers both tiles")
+    view = front_view()
+    proj.begin_view(*view)
+    proj.set_tip(None)
+    proj.clear_mask()
+    proj.dabs([(W / 2, H / 2, 60, 1.0, 1.0, 0.0)])
+    m = proj.read_mask() > 0.5
+    h, w = 256, 512
+    u = (np.arange(w) + 0.5) / w * 2
+    v = (np.arange(h) + 0.5) / h
+    uu, vv = np.meshgrid(u, v)
+    world = np.stack([2 * uu - 2, np.zeros_like(uu), 2 * vv - 1, np.ones_like(uu)], -1)
+    clip = world @ np.array(view[2], np.float32).T
+    sx = (clip[..., 0] / clip[..., 3] * 0.5 + 0.5) * W
+    sy = (clip[..., 1] / clip[..., 3] * 0.5 + 0.5) * H
+    ref = np.hypot(sx - W / 2, sy - H / 2) < 60
+    iou = (m & ref).sum() / max((m | ref).sum(), 1)
+    check(iou > 0.95 and m[:, :256].any() and m[:, 256:].any(),
+          f"dab across the tile border matches the reference (IoU {iou:.3f})")
+    regions = proj.regions_for([(W / 2, H / 2, 60)])
+    check(all(r[1] <= 256 and r[3] <= 512 for r in regions), "regions stay inside the layout")
+    proj.free()
+
+    # Bake through the atlas UV map
+    s = ts.bake
+    s.samples = 2
+    s.use_normal = s.use_id = s.use_thickness = s.use_curvature = False
+    with override(obj):
+        bpy.ops.paintstack.bake()
+    pos = px_mod.read(ts.baked_map("POSITION"))
+    check(tuple(ts.baked_map("POSITION").size) == (512, 256), "baked maps cover both tiles")
+    left, right = pos[64:192, 16:240, 0].mean(), pos[64:192, 272:496, 0].mean()
+    check(right > left + 0.3, f"position bake follows the tiles (x: {left:.2f} | {right:.2f})")
+    from paintstack import picking
+    l_px = picking.sample(ts.baked_map("POSITION"), (0.5, 0.5), ts.grid)
+    r_px = picking.sample(ts.baked_map("POSITION"), (1.5, 0.5), ts.grid)
+    check(r_px[0] > l_px[0] + 0.3, f"picking reads the right tile ({l_px[0]:.2f} | {r_px[0]:.2f})")
+    check([l.name for l in obj.data.uv_layers] == ["UVMap"] and obj.data.uv_layers.active.name == "UVMap",
+          "temporary atlas UV map removed after baking")
+
+    # Layers on the atlas: GPU == CPU (non-square images, filters, generator masks)
+    from paintstack import grunge
+    with override(obj):
+        bpy.ops.paintstack.layer_add(type="PAINT")
+    paint = ts.active_layer
+    plc = paint.channel("BASE_COLOR")
+    ops.ensure_layer_image(mat, paint, plc)
+    px_mod.write(plc.image, np.random.default_rng(9).random((256, 512, 4)).astype(np.float32))
+    compositor.invalidate(mat, paint.uid)  # what a stroke does after writing a layer
+    paint_uid = paint.uid  # (layer references go stale when layers are added)
+    with override(obj):
+        bpy.ops.paintstack.layer_add(type="FILL")
+        bpy.ops.paintstack.effect_add(type="NOISE")
+        bpy.ops.paintstack.effect_add(type="BLUR")
+    fill = ts.active_layer
+    fill.channel("BASE_COLOR").color = (0.9, 0.1, 0.1)
+    fill.channel("ROUGHNESS").texture = grunge.make_image("CELLS", 0)
+    with override(obj):
+        bpy.ops.paintstack.layer_add(type="FILTER")
+    filt = ts.active_layer
+    for kind in ("BLUR", "WARP"):
+        filt.filter_type = kind
+        compositor.BACKEND_OVERRIDE = "CPU"
+        compositor.composite(mat)
+        cpu = outputs(ts)
+        compositor.BACKEND_OVERRIDE = "GPU"
+        compositor.DEFER_OVERRIDE = False
+        compositor.composite(mat)
+        gpu_ = outputs(ts)
+        d = max(float(np.abs(cpu[c] - gpu_[c]).max()) for c in cpu)
+        varied = min(float(cpu[c].std()) for c in ("BASE_COLOR", "ROUGHNESS"))
+        check(d <= TOL and varied > 0.01 and compositor.use_gpu(ts),
+              f"UDIM atlas with a {kind} filter: GPU == CPU (max diff {d:.4f}, std {varied:.3f})")
+    # A live stroke across the tile border, on top of a pending GPU composite
+    ts.active_layer_index = next(i for i, l in enumerate(ts.layers) if l.uid == paint_uid)
+    plc = ts.active_layer.channel("BASE_COLOR")
+    compositor.BACKEND_OVERRIDE = "GPU"
+    compositor.DEFER_OVERRIDE = True
+    compositor.composite(mat)
+    before = px_mod.read(plc.image).copy()
+    st_ = stroke(obj, mat, True)
+    st_.finish()
+    compositor.sync_outputs(mat)
+    got = outputs(ts)
+    changed = np.abs(px_mod.read(plc.image) - before).max(-1) > 0.01
+    compositor.DEFER_OVERRIDE = None
+    ref = reference(mat)
+    d = max(float(np.abs(got[c] - ref[c]).max()) for c in got)
+    check(changed[:, :256].any() and changed[:, 256:].any() and d <= TOL,
+          f"UDIM stroke paints both tiles; result == CPU composite (max diff {d:.4f})")
+    compositor.BACKEND_OVERRIDE = compositor.DEFER_OVERRIDE = None
+
+    # Material samples the layout; export writes one file per tile
+    mapping = mat.node_tree.nodes.get("PS_UDIM Layout")
+    check(mapping is not None and tuple(mapping.inputs["Scale"].default_value)[:2] == (0.5, 1.0),
+          "material maps UVs to the tile layout")
+    d = tempfile.mkdtemp()
+    with override(obj):
+        bpy.ops.paintstack.export(directory=d, preset="BLENDER", padding=0)
+    files = sorted(os.listdir(d))
+    check("Material_BaseColor.1001.png" in files or any(f.endswith("_BaseColor.1001.png") for f in files),
+          f"UDIM export names ({files[:3]}...)")
+    tile2 = [f for f in files if f.endswith("_BaseColor.1002.png")]
+    if tile2:
+        img = bpy.data.images.load(os.path.join(d, tile2[0]))
+        check(tuple(img.size) == (256, 256), "each exported tile has the tile resolution")
+        bpy.data.images.remove(img)
+
+    # Too large for the GPU: refused, previous resolution kept
+    ts.udim_tiles = "1001-1005"
+    ts.resolution = "4096"  # 5 x 4096 = 20480 > 16384
+    check(ts.resolution == "256" and tuple(ts.output("BASE_COLOR").size) == (1280, 256),
+          f"oversized layout refused ({ts.resolution}, {ops._size_error})")
+
+
 def generators_id_color(ts):
     from paintstack import generators
     idm = generators.baked(ts, "ID")
@@ -172,6 +335,7 @@ def generators_id_color(ts):
 
 
 def main():
+    udim_checks()
     gpu_mask_checks()
     obj, mat = scene()
     ts = mat.paintstack

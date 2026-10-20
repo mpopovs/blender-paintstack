@@ -47,20 +47,20 @@ def _cached(key, fn):
 
 
 def baked(ts, map_type):
-    """Baked map resampled to the texture set resolution, (res, res, 3), or None."""
+    """Baked map resampled to the texture set's image size, (h, w, 3), or None."""
     img = ts.baked_map(map_type)
     if img is None:
         return None
-    res = ts.res
+    h, w = ts.shape
 
     def load():
         px = pixels.read(img)[..., :3]
-        if px.shape[0] != res or px.shape[1] != res:
-            ys = (np.arange(res) * px.shape[0] // res)
-            xs = (np.arange(res) * px.shape[1] // res)
+        if px.shape[0] != h or px.shape[1] != w:
+            ys = (np.arange(h) * px.shape[0] // h)
+            xs = (np.arange(w) * px.shape[1] // w)
             px = px[ys][:, xs]
         return np.ascontiguousarray(px)
-    return _cached(("map", img.name, res, _generation), load)
+    return _cached(("map", img.name, (h, w), _generation), load)
 
 
 def missing(effect, ts):
@@ -123,9 +123,8 @@ def _positions(ts):
     if pos is not None:
         return pos
     # No position bake: fall back to UV space (noise will show UV seams).
-    res = ts.res
-    g = (np.arange(res, dtype=np.float32) + 0.5) / res
-    u, v = np.meshgrid(g, g)
+    from .fills import uv_grid
+    u, v = uv_grid(ts)
     return np.stack([u, v, np.zeros_like(u)], -1)
 
 
@@ -170,7 +169,7 @@ def fbm_fast(pos, scale, octaves, seed):
 
 
 def _noise(effect, ts):
-    key = ("noise", ts.id_data.name, ts.res, _generation, effect.noise_scale,
+    key = ("noise", ts.id_data.name, ts.size, _generation, effect.noise_scale,
            effect.noise_octaves, effect.seed)
     return _cached(key, lambda: fbm_fast(_positions(ts), effect.noise_scale,
                                          effect.noise_octaves, effect.seed))
@@ -190,11 +189,11 @@ def evaluate(effect, ts):
     if missing(effect, ts):
         return None
     if effect.type == "ID_MASK":
-        key = ("id", ts.id_data.name, ts.res, _generation, tuple(effect.id_color), effect.id_tolerance)
+        key = ("id", ts.id_data.name, ts.size, _generation, tuple(effect.id_color), effect.id_tolerance)
         return _cached(key, lambda: id_selection(baked(ts, "ID"), effect.id_color,
                                                  effect.id_tolerance).astype(np.float32))
 
-    key = ("gen", ts.id_data.name, ts.res, _generation, effect.type, effect.level,
+    key = ("gen", ts.id_data.name, ts.size, _generation, effect.type, effect.level,
            effect.softness, effect.noise_amount, effect.noise_scale, effect.noise_octaves,
            effect.seed, effect.axis, effect.grunge, effect.grunge_tiling)
 
@@ -202,7 +201,7 @@ def evaluate(effect, ts):
         if effect.type == "NOISE":
             v = _noise(effect, ts)
         else:
-            src_key = ("src", ts.id_data.name, ts.res, _generation, effect.type, effect.axis,
+            src_key = ("src", ts.id_data.name, ts.size, _generation, effect.type, effect.axis,
                        effect.grunge, effect.grunge_tiling, effect.seed if effect.type == "GRUNGE" else 0)
             v = _cached(src_key, lambda: _source(effect, ts))
             if effect.noise_amount > 0.0:

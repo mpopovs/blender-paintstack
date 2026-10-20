@@ -24,9 +24,13 @@ def bilinear_wrap(img, u, v):
     return top * (1 - fy) + bot * fy
 
 
-def _uv_grid(res):
-    g = (np.arange(res, dtype=np.float32) + 0.5) / res
-    return np.meshgrid(g, g)
+def uv_grid(ts):
+    """UV coordinates of every texel centre of the texture set's images (tiles
+    included: u runs over 0..columns, v over 0..rows)."""
+    h, w = ts.shape
+    cols, rows = ts.grid
+    return np.meshgrid((np.arange(w, dtype=np.float32) + 0.5) / w * cols,
+                       (np.arange(h, dtype=np.float32) + 0.5) / h * rows)
 
 
 def can_triplanar(ts):
@@ -36,9 +40,8 @@ def can_triplanar(ts):
 def project(ts, tex, tiling, triplanar):
     """Map a tileable (h, w, c) texture onto the texture set: UV tiling, or
     tri-planar from the baked Position / World Normal maps."""
-    res = ts.res
     if not (triplanar and can_triplanar(ts)):
-        u, v = _uv_grid(res)
+        u, v = uv_grid(ts)
         return bilinear_wrap(tex, u * tiling, v * tiling)
     pos = generators.baked(ts, "POSITION") * tiling
     n = generators.baked(ts, "WORLD_NORMAL") * 2.0 - 1.0
@@ -53,5 +56,5 @@ def project(ts, tex, tiling, triplanar):
 def sample(ts, layer, image, allow_triplanar=True):
     """(res, res, 3) texture for a fill layer channel, cached until inputs change."""
     triplanar = allow_triplanar and layer.projection == "TRIPLANAR" and can_triplanar(ts)
-    key = ("fill", image.name, tuple(image.size), ts.res, layer.tiling, triplanar, generators._generation)
+    key = ("fill", image.name, tuple(image.size), ts.size, layer.tiling, triplanar, generators._generation)
     return generators._cached(key, lambda: project(ts, pixels.read(image)[..., :3], layer.tiling, triplanar))

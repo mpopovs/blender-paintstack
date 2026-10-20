@@ -283,6 +283,35 @@ def _resolution_changed(self, context):
     ops.resize_texture_set(self.id_data)
 
 
+def _tiles_changed(self, context):
+    from . import ops
+    ops.relayout_texture_set(self.id_data)
+
+
+MAX_ATLAS = 16384  # largest texture side every GPU backend (Metal included) supports
+
+
+def parse_tiles(text):
+    """Sorted UDIM tile numbers from '1001, 1002-1004' style text ([1001] if empty)."""
+    tiles = set()
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            tiles.update(range(int(a), int(b) + 1))
+        else:
+            tiles.add(int(part))
+    tiles = sorted(t for t in tiles if 1001 <= t <= 1100)
+    return tiles or [1001]
+
+
+def tile_cell(tile):
+    """(column, row) of a UDIM tile in the atlas: 1001 is bottom left, 10 per row."""
+    return (tile - 1001) % 10, (tile - 1001) // 10
+
+
 def _view_changed(self, context):
     from . import compositor, material
     material.build(self.id_data)
@@ -303,7 +332,18 @@ def _rebuild_material(self, context):
 
 class PS_TextureSet(PropertyGroup):
     initialized: BoolProperty(default=False)
-    resolution: EnumProperty(items=RESOLUTIONS, default="2048", update=_resolution_changed)
+    resolution: EnumProperty(items=RESOLUTIONS, default="2048", update=_resolution_changed,
+                             description="Texels per side of each UV tile")
+    udim_tiles: StringProperty(
+        name="UDIM Tiles", default="", update=_tiles_changed,
+        description="UDIM tiles to paint, e.g. '1001-1004, 1011' (empty: just the 0-1 UV square). "
+                    "Each tile gets the full resolution; they are stored side by side")
+    # Grid and settings the images are currently laid out for (to re-layout them on
+    # a change, or to go back when a change would exceed the GPU's texture size).
+    layout_cols: IntProperty(default=1)
+    layout_rows: IntProperty(default=1)
+    applied_tiles: StringProperty(default="")
+    applied_resolution: StringProperty(default="2048")
     use_base_color: BoolProperty(name="Base Color", default=True, update=_recomposite)
     use_metallic: BoolProperty(name="Metallic", default=True, update=_recomposite)
     use_roughness: BoolProperty(name="Roughness", default=True, update=_recomposite)
@@ -333,7 +373,31 @@ class PS_TextureSet(PropertyGroup):
 
     @property
     def res(self):
+        """Texels per side of one UV tile."""
         return int(self.resolution)
+
+    @property
+    def tiles(self):
+        return parse_tiles(self.udim_tiles)
+
+    @property
+    def grid(self):
+        """(columns, rows) of UV tiles covered by the images."""
+        cells = [tile_cell(t) for t in self.tiles]
+        return max(c for c, _ in cells) + 1, max(r for _, r in cells) + 1
+
+    @property
+    def size(self):
+        """(width, height) of every texture-set image: the tiles side by side, laid
+        out like UV space (tile 1001 bottom left), so atlas UV = (u / cols, v / rows)."""
+        cols, rows = self.grid
+        return self.res * cols, self.res * rows
+
+    @property
+    def shape(self):
+        """(height, width) of the texture-set arrays."""
+        w, h = self.size
+        return h, w
 
     @property
     def active_layer(self):
