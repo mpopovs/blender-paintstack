@@ -43,8 +43,9 @@ The **test kit** (`paintstack-<version>-testkit.zip`) contains the add-on source
    sh ~/Downloads/paintstack-<version>-testkit/tests/run_on_mac.sh
    ```
    If Blender is not at `/Applications/Blender.app`, add its path: `sh …/run_on_mac.sh /path/to/Blender.app`.
-3. A Blender window opens. It may look frozen while the tests run, which takes a few minutes. It closes by itself.
-4. Send back **`~/Desktop/paintstack_report.txt`**. Its first line says `RESULT: ALL PASSED` or how many checks failed. It also contains the Diagnostics (Metal checks) and the CPU and GPU benchmarks.
+   From a git clone, run it from the repository folder: `sh tests/run_on_mac.sh`. Add `"" --no-bench` to skip the benchmark: `sh tests/run_on_mac.sh "" --no-bench`.
+3. Each step (every test suite, then Diagnostics, then the benchmarks) opens its own Blender window. The window may look frozen while that step runs, and it closes by itself. The Terminal prints `OK`, `FAILED` or `BLENDER CRASHED` for each step.
+4. Send back **`~/Desktop/paintstack_report.txt`**. Its first line says `RESULT: ALL PASSED` or how many steps failed. It also contains the Diagnostics (Metal checks) and the CPU and GPU benchmarks. If Blender crashed, the report names the step, shows the last test lines it printed and the Python stack at the crash. Per-step logs are in `~/Desktop/paintstack_report_steps/`.
 
 The run uses `--factory-startup`, so your preferences, installed add-ons and open files are not touched. It loads PaintStack from the test kit, not from your installed copy.
 

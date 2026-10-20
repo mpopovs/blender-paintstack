@@ -164,9 +164,17 @@ def main():
     # Save / reload keeps painted pixels
     blend = os.path.join(d, "test.blend")
     mat_name = mat.name
-    bpy.ops.wm.save_as_mainfile(filepath=blend)
-    bpy.ops.wm.open_mainfile(filepath=blend)
-    mat = bpy.data.materials[mat_name]
+    bpy.ops.wm.save_as_mainfile(filepath=blend, copy=True)
+    if bpy.app.background:
+        bpy.ops.wm.open_mainfile(filepath=blend)
+        mat = bpy.data.materials[mat_name]
+    else:
+        # In the Blender app, reloading the file from a running script frees the
+        # window and screen the test runner is using (and crashes Blender), so
+        # read the saved material back from the file instead.
+        with bpy.data.libraries.load(blend, link=False) as (src, dst):
+            dst.materials = [mat_name]
+        mat = dst.materials[0]
     lc = mat.paintstack.layers[1].channel("BASE_COLOR")
     check(lc.image is not None and lc.image.packed_file is not None, "layer image packed in .blend")
     reread = pixels.read(mat.paintstack.output("BASE_COLOR"))

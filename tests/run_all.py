@@ -3,6 +3,13 @@ and write one report file.
 
 On a Mac (Metal), from a Terminal:
     sh tests/run_on_mac.sh [/Applications/Blender.app]
+(each step runs in its own Blender process, so a crash only loses that step and
+the report says where it happened)
+
+One step in its own process (what run_on_mac.sh does):
+    <blender> --factory-startup --python tests/run_all.py -- --only STEP --out DIR
+STEP is "info", a suite name, "diagnostics", "bench-cpu" or "bench-gpu"; the
+result goes to DIR/STEP.txt, a native crash's Python stack to DIR/STEP.fault.log.
 
 Any Blender build (a window opens, runs everything, and closes):
     <blender> --factory-startup --python tests/run_all.py -- [--report FILE] [--no-bench] [--keep-open]
@@ -32,12 +39,15 @@ SUITES = ["test_headless", "test_phase2", "test_phase2_extras", "test_phase3", "
 
 def _args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
-    opts = {"report": None, "bench": True, "keep_open": False}
+    opts = {"report": None, "bench": True, "keep_open": False, "only": None, "out": None}
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--report" and i + 1 < len(argv):
             opts["report"] = argv[i + 1]
+            i += 1
+        elif a in ("--only", "--out") and i + 1 < len(argv):
+            opts[a[2:]] = argv[i + 1]
             i += 1
         elif a == "--no-bench":
             opts["bench"] = False
@@ -58,6 +68,7 @@ class Tee(io.StringIO):
 
     def write(self, s):
         self.real.write(s)
+        self.real.flush()  # the last line printed before a native crash must reach the log
         return super().write(s)
 
 
@@ -148,6 +159,81 @@ def run(opts):
     return total_fail
 
 
+def _header():
+    from paintstack import hardware
+    lines = [f"Blender {bpy.app.version_string}  ({'background' if bpy.app.background else 'UI'})",
+             f"{platform.platform()}  python {platform.python_version()}"]
+    return lines + [f"  {k}: {v}" for k, v in hardware.summary().items()]
+
+
+def run_step(step):
+    """One step, for a fresh Blender process. Returns (ok, report lines)."""
+    from _env import fresh_scene
+    from paintstack import hardware
+    fresh_scene()
+    if step == "info":
+        return True, _header()
+    if step in SUITES:
+        res = run_suite(step)
+        ok = not res["failed"] and not res["crashed"]
+        lines = [f"[{'OK' if ok else 'FAILED'}] {step}: {res['passed']} passed, "
+                 f"{len(res['failed'])} failed ({res['seconds']:.0f} s)"]
+        lines += [f"    {l}" for l in res["failed"]]
+        if res["crashed"]:
+            lines += ["    ERROR:"] + [f"      {l}" for l in res["crashed"].splitlines()]
+        return ok, lines
+    if step == "diagnostics":
+        from paintstack import diagnostics
+        try:
+            diag = diagnostics.run()
+        except Exception:
+            return False, ["Diagnostics ERROR:"] + [f"  {l}" for l in traceback.format_exc().splitlines()]
+        return diag.failures == 0, ["Diagnostics:"] + [f"  {l}" for l in diag.lines]
+    if step in ("bench-cpu", "bench-gpu"):
+        import json
+        import bench
+        backend = step[-3:].upper()
+        if backend == "GPU" and not hardware.gpu_is_hardware():
+            return True, ["Benchmark GPU: skipped (software GPU)"]
+        try:
+            with contextlib.redirect_stdout(Tee(sys.__stdout__)):
+                rows = bench.main([1024, 2048], backend)
+        except Exception:
+            return False, [f"Benchmark {backend} ERROR:"] + \
+                          [f"  {l}" for l in traceback.format_exc().splitlines()]
+        return True, [f"Benchmark {backend} (ms):"] + [f"  {json.dumps(r)}" for r in rows]
+    return False, [f"Unknown step: {step}"]
+
+
+def _step_main(opts):
+    step, out = opts["only"], opts["out"] or HERE
+    os.makedirs(out, exist_ok=True)
+    try:
+        ok, lines = run_step(step)
+    except Exception:
+        ok, lines = False, [f"[FAILED] {step} ERROR:"] + \
+                           [f"    {l}" for l in traceback.format_exc().splitlines()]
+    _write(os.path.join(out, step + ".txt"), [f"STATUS {'OK' if ok else 'FAILED'}"] + lines)
+    return 0 if ok else 1
+
+
+def _enable_faulthandler(opts):
+    """A segfault in Blender/GPU code leaves the Python stack (which test line) behind."""
+    import faulthandler
+    if opts["only"]:
+        out = opts["out"] or HERE
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, opts["only"] + ".fault.log")
+    else:
+        path = os.path.splitext(opts["report"])[0] + ".fault.log"
+    try:
+        f = open(path, "w")
+        faulthandler.enable(file=f, all_threads=True)
+        _enable_faulthandler.file = f  # keep it open for the whole run
+    except OSError:
+        pass
+
+
 def _write(path, lines):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -166,14 +252,16 @@ def _ui_context():
 
 def main():
     opts = _args()
+    _enable_faulthandler(opts)
+    work = (lambda: _step_main(opts)) if opts["only"] else (lambda: run(opts))
     if bpy.app.background or not bpy.context.window_manager.windows:
-        fails = run(opts)
+        fails = work()
         sys.exit(1 if fails else 0)
 
     def in_ui():
         # Runs from the event loop, so the window and its GPU (Metal) context exist.
         with bpy.context.temp_override(**_ui_context()):
-            run(opts)
+            work()
             if not opts["keep_open"]:
                 # Factory-startup session: nothing to save, so skip the "save changes?"
                 # prompt that would otherwise keep the window open.
