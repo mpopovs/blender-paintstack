@@ -110,6 +110,15 @@ def _reblend(self, context):
         compositor.request(mat, *_owner(self), blend_only=True)
 
 
+def _remask(self, context):
+    """Property update for a layer's mask stack: only its mask is recomputed (on
+    the GPU compositor, from cached sources with the new values as constants)."""
+    from . import compositor
+    mat = self.id_data
+    if isinstance(mat, bpy.types.Material):
+        compositor.request(mat, _owner(self)[0], mask_only=True)
+
+
 class PS_LayerChannel(PropertyGroup):
     channel: EnumProperty(items=CHANNEL_ITEMS)
     enabled: BoolProperty(default=True, update=_reblend)
@@ -127,40 +136,40 @@ class PS_LayerChannel(PropertyGroup):
 
 class PS_MaskEffect(PropertyGroup):
     name: StringProperty(default="Effect")
-    type: EnumProperty(items=EFFECT_TYPES, update=_recomposite)
-    enabled: BoolProperty(default=True, update=_recomposite)
-    blend_mode: EnumProperty(items=MASK_BLEND_MODES, default="NORMAL", update=_recomposite)
-    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_recomposite)
-    invert: BoolProperty(default=False, update=_recomposite)
+    type: EnumProperty(items=EFFECT_TYPES, update=_remask)
+    enabled: BoolProperty(default=True, update=_remask)
+    blend_mode: EnumProperty(items=MASK_BLEND_MODES, default="NORMAL", update=_remask)
+    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_remask)
+    invert: BoolProperty(default=False, update=_remask)
 
     # Generators: smoothstep(level - softness, level + softness, source + noise)
     level: FloatProperty(name="Level", min=0.0, max=1.0, default=0.5, subtype="FACTOR",
-                         update=_recomposite, description="Higher = more coverage")
+                         update=_remask, description="Higher = more coverage")
     softness: FloatProperty(name="Softness", min=0.001, max=1.0, default=0.15, subtype="FACTOR",
-                            update=_recomposite)
-    noise_amount: FloatProperty(name="Noise", min=0.0, max=2.0, default=0.4, update=_recomposite)
-    noise_scale: FloatProperty(name="Noise Scale", min=0.1, max=200.0, default=12.0, update=_recomposite)
-    noise_octaves: IntProperty(name="Detail", min=1, max=8, default=4, update=_recomposite)
-    seed: IntProperty(name="Seed", min=0, default=0, update=_recomposite)
+                            update=_remask)
+    noise_amount: FloatProperty(name="Noise", min=0.0, max=2.0, default=0.4, update=_remask)
+    noise_scale: FloatProperty(name="Noise Scale", min=0.1, max=200.0, default=12.0, update=_remask)
+    noise_octaves: IntProperty(name="Detail", min=1, max=8, default=4, update=_remask)
+    seed: IntProperty(name="Seed", min=0, default=0, update=_remask)
     axis: EnumProperty(name="Axis", items=[("X", "X", ""), ("Y", "Y", ""), ("Z", "Z", "")],
-                       default="Z", update=_recomposite)
+                       default="Z", update=_remask)
 
     value: FloatProperty(name="Value", min=0.0, max=1.0, default=1.0, subtype="FACTOR",
-                         update=_recomposite)
-    in_min: FloatProperty(name="Input Min", min=0.0, max=1.0, default=0.0, update=_recomposite)
-    in_max: FloatProperty(name="Input Max", min=0.0, max=1.0, default=1.0, update=_recomposite)
-    gamma: FloatProperty(name="Gamma", min=0.05, max=10.0, default=1.0, update=_recomposite)
+                         update=_remask)
+    in_min: FloatProperty(name="Input Min", min=0.0, max=1.0, default=0.0, update=_remask)
+    in_max: FloatProperty(name="Input Max", min=0.0, max=1.0, default=1.0, update=_remask)
+    gamma: FloatProperty(name="Gamma", min=0.05, max=10.0, default=1.0, update=_remask)
     blur_radius: IntProperty(name="Radius", min=1, max=64, default=4, subtype="PIXEL",
-                             update=_recomposite)
+                             update=_remask)
     id_color: FloatVectorProperty(name="ID Color", subtype="COLOR", size=3, min=0.0, max=1.0,
-                                  default=(1.0, 1.0, 1.0), update=_recomposite)
-    id_tolerance: FloatProperty(name="Tolerance", min=0.001, max=1.0, default=0.1, update=_recomposite)
-    grunge: EnumProperty(name="Texture", items=GRUNGE_TYPES, update=_recomposite)
-    grunge_tiling: FloatProperty(name="Tiling", min=0.05, max=50.0, default=2.0, update=_recomposite)
-    anchor_uid: StringProperty(name="Anchor", update=_recomposite,
+                                  default=(1.0, 1.0, 1.0), update=_remask)
+    id_tolerance: FloatProperty(name="Tolerance", min=0.001, max=1.0, default=0.1, update=_remask)
+    grunge: EnumProperty(name="Texture", items=GRUNGE_TYPES, update=_remask)
+    grunge_tiling: FloatProperty(name="Tiling", min=0.05, max=50.0, default=2.0, update=_remask)
+    anchor_uid: StringProperty(name="Anchor", update=_remask,
                                description="uid of the anchor layer this effect reads")
     anchor_channel: EnumProperty(name="Channel", items=CHANNEL_ITEMS, default="HEIGHT",
-                                 update=_recomposite)
+                                 update=_remask)
     # PAINT effects: RGBA, value in R, coverage in A
     image: PointerProperty(type=bpy.types.Image)
 
@@ -201,8 +210,8 @@ class PS_Layer(PropertyGroup):
     channels: CollectionProperty(type=PS_LayerChannel)
 
     mask_image: PointerProperty(type=bpy.types.Image)
-    mask_enabled: BoolProperty(default=True, update=_recomposite)
-    mask_invert: BoolProperty(default=False, update=_recomposite)
+    mask_enabled: BoolProperty(default=True, update=_remask)
+    mask_invert: BoolProperty(default=False, update=_remask)
     edit_target: EnumProperty(
         name="Paint Target",
         items=[("CONTENT", "Content", "Paint the layer's channels", "BRUSH_DATA", 0),

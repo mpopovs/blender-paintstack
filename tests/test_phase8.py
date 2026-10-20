@@ -90,7 +90,89 @@ def stroke(obj, mat, live, seed=0):
     return s
 
 
+def gpu_mask_checks():
+    """Every mask effect, blend mode, invert and filter: GPU mask == CPU mask."""
+    from paintstack import masks, ops, pixels as px_mod
+    from paintstack.engine import gpu_masks
+    fresh_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16)
+    obj = bpy.context.active_object
+    with override(obj):
+        bpy.ops.paintstack.init()
+    mat = obj.active_material
+    ts = mat.paintstack
+    ts.resolution = "256"
+    s = ts.bake
+    s.samples = 2
+    s.use_normal = False
+    s.use_id = s.use_thickness = True
+    with override(obj):
+        bpy.ops.paintstack.bake()
+        bpy.ops.paintstack.layer_add(type="FILL")
+    layer = ts.active_layer
+    ops.add_mask(mat, layer)
+    rng = np.random.default_rng(3)
+    px_mod.write(layer.mask_image, rng.random((256, 256, 4)).astype(np.float32))
+    gc = gpu_compositor.instance()
+    gc.namespace = mat.name
+    modes = ["NORMAL", "MULTIPLY", "ADD", "SUBTRACT", "MAX", "MIN"]
+    worst = (0.0, "")
+
+    def compare(label, varied=True):
+        nonlocal worst
+        cpu = masks.evaluate(layer, None, {})
+        t = gpu_masks.evaluate(gc, layer, compositor.state(mat).cache, set())
+        g = gc.read(t)[..., 0]
+        gc.release(t)
+        d = float(np.abs(g - cpu).max())
+        if d > worst[0]:
+            worst = (d, label)
+        check(d < 4e-3 and (not varied or 0.005 < float(cpu.std())), f"GPU mask == CPU: {label} (max diff {d:.4f}, "
+                                                    f"mean {float(cpu.mean()):.2f}, std {float(cpu.std()):.2f})")
+
+    compare("mask image only")
+
+    def add_effect(i, kind, stacked):
+        if not stacked:
+            layer.mask_effects.clear()
+        e = ops.add_mask_effect(mat, layer, kind)
+        if kind == "PAINT":
+            ops.ensure_effect_image(mat, layer, e)
+            px_mod.write(e.image, rng.random((256, 256, 4)).astype(np.float32))
+        if kind not in ("LEVELS", "BLUR"):
+            e.blend_mode = modes[i % len(modes)]
+        e.opacity = 0.75
+        e.invert = i % 3 == 0
+        if kind == "FILL":
+            e.value = 0.3
+        if kind == "LEVELS":
+            e.in_min, e.in_max, e.gamma = 0.1, 0.8, 1.7
+        if kind == "ID_MASK":
+            e.id_color = tuple(generators_id_color(ts))
+        if hasattr(e, "level"):
+            e.level, e.softness = 0.55, 0.15
+        compare(f"{'stack + ' if stacked else ''}{kind} ({e.blend_mode}{', inverted' if e.invert else ''})",
+                varied=not stacked)
+
+    kinds = ["PAINT", "FILL", "EDGE_WEAR", "DIRT", "CURVATURE", "AO", "THICKNESS", "POSITION", "NOISE",
+             "ID_MASK", "GRUNGE", "LEVELS", "BLUR"]
+    for stacked in (False, True):
+        layer.mask_effects.clear()
+        for i, kind in enumerate(kinds):
+            add_effect(i, kind, stacked)
+    layer.mask_invert = True
+    compare("inverted layer mask")
+    print(f"worst GPU mask difference {worst[0]:.4f} ({worst[1]})")
+
+
+def generators_id_color(ts):
+    from paintstack import generators
+    idm = generators.baked(ts, "ID")
+    return idm[idm.shape[0] // 2, idm.shape[1] // 2]
+
+
 def main():
+    gpu_mask_checks()
     obj, mat = scene()
     ts = mat.paintstack
     tint = ts.layers[0]

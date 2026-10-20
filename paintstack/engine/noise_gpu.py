@@ -106,3 +106,28 @@ def fbm(pos, scale, octaves, perm, vals):
         return read_texture(off.texture_color).astype(np.float32)
     finally:
         off.free()
+
+
+def fbm_target(gc, pos_tex, res, scale, octaves, perm, vals):
+    """fBm of a positions texture into a new RGBA32F gpu_compositor.Target (red),
+    staying on the GPU (for GPU masks)."""
+    from .gpu_compositor import Target
+    from .projector import _white
+    sh = _get_shader()
+    out = Target(res, res, "RGBA32F")
+    tex_perm = make_texture(perm.reshape(1, -1), "R32F")
+    tex_vals = make_texture(vals.reshape(1, -1), "R32F")
+    batch = batch_for_shader(sh, "TRI_FAN", {"pos": ((-1, -1), (1, -1), (1, 1), (-1, 1))})
+    with out.fb.bind():
+        gpu.state.blend_set("NONE")
+        gpu.state.viewport_set(0, 0, res, res)
+        sh.bind()
+        sh.uniform_float("params", (scale, 0.0, 0.0, 0.0))
+        sh.uniform_int("octaves", octaves)
+        sh.uniform_sampler("posTex", pos_tex)
+        sh.uniform_sampler("permTex", tex_perm)
+        sh.uniform_sampler("valsTex", tex_vals)
+        batch.draw(sh)
+        for name in ("posTex", "permTex", "valsTex"):
+            sh.uniform_sampler(name, _white())
+    return out

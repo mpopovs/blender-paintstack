@@ -312,6 +312,16 @@ class GPUCompositor:
         self.uploads[key] = (tuple(arrays), tex)
         return tex
 
+    def memo(self, key, arrays, make):
+        """Like upload, for GPU objects made by make() (e.g. a computed noise field)."""
+        key = (self.namespace,) + tuple(key)
+        hit = self.uploads.get(key)
+        if hit is not None and len(hit[0]) == len(arrays) and all(a is b for a, b in zip(hit[0], arrays)):
+            return hit[1]
+        obj = make()
+        self.uploads[key] = (tuple(arrays), obj)
+        return obj
+
     def forget_unused(self, namespace, keys):
         """Drop uploads of one material that the last composite did not use, and
         keep only a few spare render targets per size."""
@@ -365,7 +375,10 @@ class GPUCompositor:
             else:
                 layer = self.upload(parts.src_key, [src], lambda: np.concatenate(
                     [src, np.ones(src.shape[:2] + (1,), np.float32)], -1))
-        mask = self.mask_texture(parts.mask, parts.mask_key) if parts.mask is not None else None
+        if parts.mask_tex is not None:
+            mask = parts.mask_tex
+        else:
+            mask = self.mask_texture(parts.mask, parts.mask_key) if parts.mask is not None else None
         scale = parts.scale * (1.0 if mask is not None or parts.mask is None else float(parts.mask))
         const = tuple(np.broadcast_to(np.asarray(src, np.float32), (3,))) if not src_tex else (0.0, 0.0, 0.0)
         out = self.op("blend", (base.w, base.h), (base.tex, layer, mask if mask is not None else _white()),
@@ -376,9 +389,10 @@ class GPUCompositor:
         self.release(base)
         return out
 
-    def fade(self, base, inner, scale, mask=None, mask_key=None):
-        """base + (inner - base) * scale * mask."""
-        mtex = self.mask_texture(mask, mask_key) if mask is not None else None
+    def fade(self, base, inner, scale, mask=None, mask_key=None, mask_tex=None):
+        """base + (inner - base) * scale * mask (a CPU mask, or mask_tex on the GPU)."""
+        mtex = mask_tex if mask_tex is not None else (
+            self.mask_texture(mask, mask_key) if mask is not None else None)
         if mask is not None and mtex is None:
             scale *= float(mask)
         out = self.op("fade", (base.w, base.h), (base.tex, inner.tex, mtex if mtex is not None else _white()),

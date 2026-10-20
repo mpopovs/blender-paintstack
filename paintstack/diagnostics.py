@@ -287,6 +287,8 @@ def _compositor_checks(r, res=2048):
             l.channel("BASE_COLOR").blend_mode = mode
             l.opacity = 0.6
             ops.add_mask_effect(mat, l, "NOISE")
+            # Mask filters run as GPU passes too (engine.gpu_masks).
+            ops.add_mask_effect(mat, l, "LEVELS" if mode == "MULTIPLY" else "BLUR")
         filt = ops.new_layer(mat, "FILTER", "Blur")
         filt.filter_type = "BLUR"
         filt.filter_radius = 2

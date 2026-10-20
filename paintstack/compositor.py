@@ -159,11 +159,12 @@ def state(mat):
     return st
 
 
-def invalidate(mat, uid=None, channel=None, blend_only=False):
+def invalidate(mat, uid=None, channel=None, blend_only=False, mask_only=False):
     """Forget cached work for one layer (uid) or, with no uid, the whole material.
     With a channel, only that channel's entry is dropped (its mask stays valid).
     blend_only: only how the layer is blended changed (opacity, colour, blend
-    mode, visibility), so its decoded pixels, mask and fill samples stay valid."""
+    mode, visibility), so its decoded pixels, mask and fill samples stay valid.
+    mask_only: only the layer's mask stack changed (decoded pixels stay valid)."""
     if uid is None:
         st = _states.get(mat.name)
         if st is not None:
@@ -173,8 +174,9 @@ def invalidate(mat, uid=None, channel=None, blend_only=False):
         return
     st = state(mat)
     st.revs[uid] = st.revs.get(uid, 0) + 1
-    if blend_only:
-        for key in [k for k in st.cache if k[0] in ("entry", "bbox") and k[1] == uid
+    if blend_only or mask_only:
+        kinds = ("entry", "bbox", "mask") if mask_only else ("entry", "bbox")
+        for key in [k for k in st.cache if k[0] in kinds and k[1] == uid
                     and (channel is None or k[2] == channel)]:
             del st.cache[key]
         return
@@ -383,15 +385,17 @@ class Parts:
     """A layer channel as the GPU blends it, from its cached pieces: the source
     (constant colour, fill sample or the painted RGBA pixels), the layer mask and
     the opacity. Keys name the uploads, so a slider change re-uploads nothing."""
-    __slots__ = ("src", "src_key", "src_alpha", "mask", "mask_key", "scale", "mode")
+    __slots__ = ("src", "src_key", "src_alpha", "mask", "mask_key", "mask_tex", "scale", "mode")
 
     def __init__(self, src, src_key, src_alpha, mask, mask_key, scale, mode):
         self.src, self.src_key, self.src_alpha = src, src_key, src_alpha
         self.mask, self.mask_key, self.scale, self.mode = mask, mask_key, scale, mode
+        self.mask_tex = None  # a GPU-evaluated mask (engine.gpu_masks) instead of mask
 
 
-def layer_parts(layer, ch, cache):
-    """Parts of a (non-volatile) layer channel, or None if it contributes nothing."""
+def layer_parts(layer, ch, cache, cpu_mask=True):
+    """Parts of a (non-volatile) layer channel, or None if it contributes nothing.
+    cpu_mask=False leaves the mask to the caller (GPU masks)."""
     if not layer.visible or layer.type in ("FOLDER", "FILTER"):
         return None
     lc = layer.channel(ch.id)
@@ -410,7 +414,7 @@ def layer_parts(layer, ch, cache):
         if lc.image is None:
             return None
         src, src_key, src_alpha = read(lc.image, None, cache), ("px", lc.image.name), True
-    mask = layer_mask(layer, None, cache)
+    mask = layer_mask(layer, None, cache) if cpu_mask else None
     return Parts(src, src_key, src_alpha, mask, ("mask", layer.uid), scale, lc.blend_mode)
 
 
@@ -626,7 +630,22 @@ def _deferred():
     return not (FORCE_SYNC or bpy.app.background) and _pref("gpu_display", True)
 
 
-def _gpu_nodes(gc, base, nodes, ch, cache, keys):
+def _gpu_mask(gc, layer, cache, keys, masks):
+    """The layer's mask for the GPU compositor, evaluated once per composite and
+    shared by every channel: a GPU target, None (no mask) or a CPU array (stacks
+    the GPU masks do not support)."""
+    if layer.uid not in masks:
+        from .engine import gpu_masks
+        if gpu_masks.supported(layer):
+            masks[layer.uid] = gpu_masks.evaluate(gc, layer, cache, keys)
+        else:
+            masks[layer.uid] = layer_mask(layer, None, cache)
+            if masks[layer.uid] is not None:
+                keys.add(("mask", layer.uid))
+    return masks[layer.uid]
+
+
+def _gpu_nodes(gc, base, nodes, ch, cache, keys, masks):
     """GPU port of composite_nodes: same culling, folder and filter rules."""
     if nodes:
         top = next((k for k, (l, _) in enumerate(nodes) if covers(l, ch)), None)
@@ -639,24 +658,36 @@ def _gpu_nodes(gc, base, nodes, ch, cache, keys):
                 continue
             opaque = layer.opacity >= 1.0 and not (layer.has_mask and layer.mask_enabled)
             if layer.type == "FOLDER" and opaque:
-                base = _gpu_nodes(gc, base, children, ch, cache, keys)
+                base = _gpu_nodes(gc, base, children, ch, cache, keys, masks)
                 continue
             if layer.type == "FOLDER":
-                inner = _gpu_nodes(gc, gc.copy(base), children, ch, cache, keys)
-                alpha = np.float32(layer.opacity)
+                inner = _gpu_nodes(gc, gc.copy(base), children, ch, cache, keys, masks)
+                alpha = layer.opacity
             else:
                 inner = gc.filter(base, layer, ch)
-                alpha = np.float32(layer.opacity * lc.opacity)
-            mask = layer_mask(layer, None, cache)
-            if mask is not None:
-                keys.add(("mask", layer.uid))
-            base = gc.fade(base, inner, float(alpha), mask, ("mask", layer.uid))
+                alpha = layer.opacity * lc.opacity
+            mask = _gpu_mask(gc, layer, cache, keys, masks)
+            if isinstance(mask, gpu_target_type()):
+                base = gc.fade(base, inner, float(alpha), mask_tex=mask.tex)
+            else:
+                base = gc.fade(base, inner, float(alpha), mask, ("mask", layer.uid))
         else:
-            parts = layer_parts(layer, ch, cache)
+            parts = layer_parts(layer, ch, cache, cpu_mask=False)
             if parts is not None:
-                keys.update(k for k in (parts.src_key, parts.mask_key if parts.mask is not None else None) if k)
+                mask = _gpu_mask(gc, layer, cache, keys, masks)
+                if isinstance(mask, gpu_target_type()):
+                    parts.mask_tex = mask.tex
+                else:
+                    parts.mask = mask
+                if parts.src_key:
+                    keys.add(parts.src_key)
                 base = gc.blend(base, parts)
     return base
+
+
+def gpu_target_type():
+    from .engine.gpu_compositor import Target
+    return Target
 
 
 def _gpu_base(gc, ts, ch, keys):
@@ -682,6 +713,7 @@ def _gpu_composite(mat, channels, changed, cache):
     gc = gpu_compositor.instance()
     gc.namespace = mat.name
     keys = set()
+    masks = {}  # layer uid -> mask for this composite (see _gpu_mask)
     nodes = stack.tree(ts)
     wanted = list(channels or enabled_channels(ts))
     start = 0
@@ -699,16 +731,20 @@ def _gpu_composite(mat, channels, changed, cache):
             if cp is not None:
                 for t in cp[2].values():
                     gc.release(t)
-            bases = {c.id: _gpu_nodes(gc, _gpu_base(gc, ts, c, keys), nodes[start + 1:], c, cache, keys)
+            bases = {c.id: _gpu_nodes(gc, _gpu_base(gc, ts, c, keys), nodes[start + 1:], c, cache, keys,
+                                      masks)
                      for c in enabled_channels(ts)}
             st.gpu_checkpoint = cp = (root.uid, sig, bases)
     results = {}
     for ch in wanted:
         if cp is not None and ch.id in cp[2]:
             base = gc.copy(cp[2][ch.id])
-            results[ch.id] = _gpu_nodes(gc, base, nodes[:start + 1], ch, cache, keys)
+            results[ch.id] = _gpu_nodes(gc, base, nodes[:start + 1], ch, cache, keys, masks)
         else:
-            results[ch.id] = _gpu_nodes(gc, _gpu_base(gc, ts, ch, keys), nodes, ch, cache, keys)
+            results[ch.id] = _gpu_nodes(gc, _gpu_base(gc, ts, ch, keys), nodes, ch, cache, keys, masks)
+    for m in masks.values():
+        if isinstance(m, gpu_target_type()):
+            gc.release(m)
     st.gpu_keys = keys
     return results
 
@@ -909,13 +945,13 @@ def _schedule(mat, key):
     _pending.setdefault(mat.name, set()).add(key)
 
 
-def request(mat, uid=None, channel=None, blend_only=False):
+def request(mat, uid=None, channel=None, blend_only=False, mask_only=False):
     """Schedule a composite. uid: the layer that changed (None = texture-set wide,
     which drops the material's cache); channel: the only channel it affects;
-    blend_only: see invalidate."""
+    blend_only, mask_only: see invalidate."""
     if not mat.paintstack.initialized:
         return
-    invalidate(mat, uid, channel, blend_only and uid is not None)
+    invalidate(mat, uid, channel, blend_only and uid is not None, mask_only and uid is not None)
     _schedule(mat, (uid, channel))
 
 
