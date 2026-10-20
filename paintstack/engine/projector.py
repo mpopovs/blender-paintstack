@@ -98,14 +98,38 @@ def _white():
     return _white_tex
 
 
-def read_texture(tex, channels=1):
-    buf = tex.read()
+_buffer_path = None  # how buffer_array last succeeded (reported by Diagnostics)
+
+
+def buffer_array(buf, count):
+    """Flat float32 array of the first `count` values of a gpu.types.Buffer.
+
+    Fast paths view the buffer's memory; each is checked for size, because some
+    Blender versions (5.1) expose only part of a multi-dimensional readback
+    buffer to numpy (one float per pixel instead of four)."""
+    global _buffer_path
     try:
-        arr = np.asarray(buf, np.float32)
-    except (TypeError, ValueError):
-        arr = np.array(buf.to_list(), np.float32)
+        buf.dimensions = count  # flat view of the whole buffer
+    except Exception:  # noqa: BLE001
+        pass
+    for path, fn in (("asarray", lambda: np.asarray(buf, np.float32).ravel()),
+                     ("frombuffer", lambda: np.frombuffer(buf, np.float32))):
+        try:
+            arr = fn()
+        except (TypeError, ValueError, BufferError):
+            continue
+        if arr.size == count:
+            _buffer_path = path
+            return arr
+    _buffer_path = "to_list"
+    return np.array(buf.to_list(), np.float32).ravel()[:count]
+
+
+def read_texture(tex, channels=1):
     h, w = tex.height, tex.width
-    return arr.reshape(h, w, -1)[..., :channels].squeeze()
+    # Every texture read back here is RGBA (offscreens and render targets).
+    arr = buffer_array(tex.read(), h * w * 4)
+    return arr.reshape(h, w, 4)[..., :channels].squeeze()
 
 
 class Projector:
@@ -323,10 +347,7 @@ class Projector:
         y0, y1, x0, x1 = region
         with self.mask.bind():
             buf = gpu.state.active_framebuffer_get().read_color(x0, y0, x1 - x0, y1 - y0, 4, 0, "FLOAT")
-        try:
-            arr = np.asarray(buf, np.float32)
-        except (TypeError, ValueError):
-            arr = np.array(buf.to_list(), np.float32)
+        arr = buffer_array(buf, (y1 - y0) * (x1 - x0) * 4)
         return arr.reshape(y1 - y0, x1 - x0, 4)[..., 0]
 
     def coverage(self):

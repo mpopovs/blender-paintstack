@@ -143,6 +143,19 @@ def run():
 
         tex = gpu.types.GPUTexture((N, N), format="RGBA32F", data=gpu.types.Buffer("FLOAT", rgba.size, rgba.ravel()))
 
+        def numpy_view():
+            from . import projector
+            raw = tex.read()
+            try:
+                plain = np.asarray(raw, np.float32).size
+            except Exception:  # noqa: BLE001
+                plain = "error"
+            arr = projector.buffer_array(tex.read(), N * N * 4).reshape(N, N, 4)
+            ok = np.allclose(arr, rgba)
+            return ok, (f"plain np.asarray sees {plain} of {N * N * 4} values; "
+                        f"PaintStack reads via {projector._buffer_path}")
+        probe("readback buffer -> numpy", numpy_view)
+
         def fetch():
             sh = _shader("void main()\n{\n  fragColor = texelFetch(src, ivec2(gl_FragCoord.xy), 0);\n}\n",
                          samplers=["src"])
