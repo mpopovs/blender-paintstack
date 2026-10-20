@@ -33,7 +33,7 @@ OUT="${REPORT%.txt}_steps"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-STEPS="info test_headless test_phase2 test_phase2_extras test_phase3 test_phase4 test_phase5 test_phase6 test_phase7 diagnostics"
+STEPS="info test_headless test_phase2 test_phase2_extras test_phase3 test_phase4 test_phase5 test_phase6 test_phase7 test_phase8 diagnostics"
 [ $BENCH = 1 ] && STEPS="$STEPS bench-cpu bench-gpu"
 [ $DIAG_ONLY = 1 ] && STEPS="info diagnostics"
 

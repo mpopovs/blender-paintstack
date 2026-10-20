@@ -86,19 +86,28 @@ def srgb_to_linear(c):
 LIVE_MIPS = 7
 
 
+def aligned(region, res):
+    """Region grown so every live mip level's block starts and ends on whole
+    texels: (y0, y1, x0, x1, levels)."""
+    y0, y1, x0, x1 = region
+    levels = min(LIVE_MIPS, int(np.log2(res)) + 1)
+    f = 1 << (levels - 1)
+    return ((y0 // f) * f, min(res, -(-y1 // f) * f), (x0 // f) * f, min(res, -(-x1 // f) * f), levels)
+
+
 def push(image, rgba, region):
     """Write region (y0, y1, x0, x1) of a full-resolution RGBA array (the image's
     stored values) into the image's GPU texture and its first mip levels."""
+    ay0, ay1, ax0, ax1, levels = aligned(region, rgba.shape[0])
+    push_block(image, rgba[ay0:ay1, ax0:ax1], ay0, ax0, levels)
+
+
+def push_block(image, block, y0, x0, levels):
+    """Write an aligned RGBA block (from `aligned`) at (y0, x0) into the image's
+    GPU texture and its first `levels` mip levels."""
     tex = gpu.texture.from_image(image)
-    y0, y1, x0, x1 = region
     convert = tex.format.startswith("SRGB") and srgb_encodes()
-    res = rgba.shape[0]
-    levels = min(LIVE_MIPS, int(np.log2(res)) + 1)
-    # Align the region so every level's block starts and ends on whole texels.
-    f = 1 << (levels - 1)
-    ay0, ax0 = (y0 // f) * f, (x0 // f) * f
-    ay1, ax1 = min(res, -(-y1 // f) * f), min(res, -(-x1 // f) * f)
-    block = np.ascontiguousarray(rgba[ay0:ay1, ax0:ax1], np.float32)
+    block = np.ascontiguousarray(block, np.float32)
     for mip in range(levels):
         if mip:
             if block.shape[0] < 2 or block.shape[1] < 2:
@@ -108,7 +117,7 @@ def push(image, rgba, region):
         if convert:
             data = np.concatenate([srgb_to_linear(block[..., :3]), block[..., 3:]], -1)
         try:
-            _blit(tex, mip, ax0 >> mip, ay0 >> mip, np.ascontiguousarray(data, np.float32))
+            _blit(tex, mip, x0 >> mip, y0 >> mip, np.ascontiguousarray(data, np.float32))
         except Exception:
             if mip == 0:
                 raise

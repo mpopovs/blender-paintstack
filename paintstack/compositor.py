@@ -159,9 +159,11 @@ def state(mat):
     return st
 
 
-def invalidate(mat, uid=None, channel=None):
+def invalidate(mat, uid=None, channel=None, blend_only=False):
     """Forget cached work for one layer (uid) or, with no uid, the whole material.
-    With a channel, only that channel's entry is dropped (its mask stays valid)."""
+    With a channel, only that channel's entry is dropped (its mask stays valid).
+    blend_only: only how the layer is blended changed (opacity, colour, blend
+    mode, visibility), so its decoded pixels, mask and fill samples stay valid."""
     if uid is None:
         st = _states.get(mat.name)
         if st is not None:
@@ -171,8 +173,13 @@ def invalidate(mat, uid=None, channel=None):
         return
     st = state(mat)
     st.revs[uid] = st.revs.get(uid, 0) + 1
+    if blend_only:
+        for key in [k for k in st.cache if k[0] in ("entry", "bbox") and k[1] == uid
+                    and (channel is None or k[2] == channel)]:
+            del st.cache[key]
+        return
     if channel is not None:
-        for key in (("entry", uid, channel), ("bbox", uid, channel)):
+        for key in (("entry", uid, channel), ("bbox", uid, channel), ("fillsrc", uid, channel)):
             st.cache.pop(key, None)
         return
     layer = next((l for l in mat.paintstack.layers if l.uid == uid), None)
@@ -226,7 +233,7 @@ def _nbytes(v):
 def _trim(st, ts):
     """Drop entries of removed layers, then evict oldest entries over budget."""
     uids = {l.uid for l in ts.layers}
-    for key in [k for k in st.cache if k[0] in ("entry", "mask") and k[1] not in uids]:
+    for key in [k for k in st.cache if k[0] in ("entry", "mask", "bbox", "fillsrc") and k[1] not in uids]:
         del st.cache[key]
     budget = _budget_bytes()
     total = sum(_nbytes(v) for v in st.cache.values())
@@ -339,13 +346,7 @@ def _layer_entry(layer, ch, overrides, cache, region):
     alpha = np.float32(layer.opacity * lc.opacity)
     if layer.type == "FILL":
         if lc.texture is not None:
-            from . import fills
-            src = fills.sample(layer.id_data.paintstack, layer, lc.texture,
-                               allow_triplanar=ch.id != "NORMAL")
-            if not ch.is_color:
-                src = np.repeat(src[..., :1] * 0.2126 + src[..., 1:2] * 0.7152
-                                + src[..., 2:3] * 0.0722, 3, -1)
-            src = crop(np.asarray(src, np.float32), region)
+            src = crop(fill_source(layer, ch, lc, cache), region)
         else:
             val = tuple(lc.color) if ch.is_color else (lc.value,) * 3
             src = np.asarray(val, np.float32)
@@ -361,6 +362,56 @@ def _layer_entry(layer, ch, overrides, cache, region):
     if not np.ndim(alpha) and alpha <= 0.0:
         return None
     return src, alpha, lc.blend_mode
+
+
+def fill_source(layer, ch, lc, cache=None):
+    """(res, res, 3) source of a textured fill layer channel (cached)."""
+    key = ("fillsrc", layer.uid, ch.id)
+    if cache is not None and key in cache:
+        return cache[key]
+    from . import fills
+    src = fills.sample(layer.id_data.paintstack, layer, lc.texture, allow_triplanar=ch.id != "NORMAL")
+    if not ch.is_color:
+        src = np.repeat(src[..., :1] * 0.2126 + src[..., 1:2] * 0.7152 + src[..., 2:3] * 0.0722, 3, -1)
+    src = np.asarray(src, np.float32)
+    if cache is not None:
+        cache[key] = src
+    return src
+
+
+class Parts:
+    """A layer channel as the GPU blends it, from its cached pieces: the source
+    (constant colour, fill sample or the painted RGBA pixels), the layer mask and
+    the opacity. Keys name the uploads, so a slider change re-uploads nothing."""
+    __slots__ = ("src", "src_key", "src_alpha", "mask", "mask_key", "scale", "mode")
+
+    def __init__(self, src, src_key, src_alpha, mask, mask_key, scale, mode):
+        self.src, self.src_key, self.src_alpha = src, src_key, src_alpha
+        self.mask, self.mask_key, self.scale, self.mode = mask, mask_key, scale, mode
+
+
+def layer_parts(layer, ch, cache):
+    """Parts of a (non-volatile) layer channel, or None if it contributes nothing."""
+    if not layer.visible or layer.type in ("FOLDER", "FILTER"):
+        return None
+    lc = layer.channel(ch.id)
+    if lc is None or not lc.enabled:
+        return None
+    scale = float(layer.opacity * lc.opacity)
+    if scale <= 0.0:
+        return None
+    if layer.type == "FILL":
+        if lc.texture is not None:
+            src, src_key = fill_source(layer, ch, lc, cache), ("fillsrc", layer.uid, ch.id)
+        else:
+            src, src_key = tuple(lc.color) if ch.is_color else (lc.value,) * 3, None
+        src_alpha = False
+    else:
+        if lc.image is None:
+            return None
+        src, src_key, src_alpha = read(lc.image, None, cache), ("px", lc.image.name), True
+    mask = layer_mask(layer, None, cache)
+    return Parts(src, src_key, src_alpha, mask, ("mask", layer.uid), scale, lc.blend_mode)
 
 
 def composite_entries(base, entries):
@@ -598,16 +649,13 @@ def _gpu_nodes(gc, base, nodes, ch, cache, keys):
                 alpha = np.float32(layer.opacity * lc.opacity)
             mask = layer_mask(layer, None, cache)
             if mask is not None:
-                alpha = mask * alpha
-            key = ("fade", layer.uid, ch.id)
-            keys.add(key)
-            base = gc.fade(base, inner, alpha, key)
+                keys.add(("mask", layer.uid))
+            base = gc.fade(base, inner, float(alpha), mask, ("mask", layer.uid))
         else:
-            entry = layer_entry(layer, ch, None, cache)
-            if entry:
-                key = ("entry", layer.uid, ch.id)
-                keys.add(key)
-                base = gc.blend(base, entry, key)
+            parts = layer_parts(layer, ch, cache)
+            if parts is not None:
+                keys.update(k for k in (parts.src_key, parts.mask_key if parts.mask is not None else None) if k)
+                base = gc.blend(base, parts)
     return base
 
 
@@ -681,6 +729,73 @@ def sync_outputs(mat):
             write_output(ts, BY_ID_[cid], gc.read(t))
         gc.release(t)
     st.gpu_results = {}
+
+
+def take_gpu_targets(mat, channel_ids):
+    """Hand pending GPU results of these channels to a stroke as GPU targets
+    ({channel_id: Target}); return them with give_gpu_target."""
+    st = _states.get(mat.name)
+    if not st or not st.gpu_results:
+        return {}
+    from .engine import gpu_compositor
+    gc = gpu_compositor.instance()
+    ts = mat.paintstack
+    out = {}
+    for cid in channel_ids:
+        t = st.gpu_results.pop(cid, None)
+        if t is None:
+            continue
+        img = ts.output(cid)
+        if img is not None and tuple(img.size) == (t.w, t.h):
+            out[cid] = t
+        else:
+            gc.release(t)
+    return out
+
+
+def give_gpu_target(mat, cid, t):
+    """A stroke's finished GPU output: shown in the viewport (with all mip levels)
+    and written to the CPU image at the next idle sync, like a GPU composite."""
+    from .engine import gpu_compositor
+    gc = gpu_compositor.instance()
+    st = state(mat)
+    gc.release(st.gpu_results.pop(cid, None))
+    if not _deferred():
+        write_output(mat.paintstack, BY_ID_[cid], gc.read(t))
+        gc.release(t)
+        return
+    gc.to_image(t, mat.paintstack.output(cid), cid == "NORMAL")
+    st.gpu_results[cid] = t
+    _schedule_sync()
+
+
+def take_gpu_outputs(mat, channel_ids):
+    """Hand pending GPU results of these channels to the caller (a stroke) as
+    finalized (res, res, 4) arrays, the way the CPU images would store them,
+    without writing the images. The caller becomes responsible for writing them;
+    other channels stay pending."""
+    st = _states.get(mat.name)
+    if not st or not st.gpu_results:
+        return {}
+    from .engine import gpu_compositor
+    from .engine.projector import read_texture
+    gc = gpu_compositor.instance()
+    ts = mat.paintstack
+    out = {}
+    for cid in channel_ids:
+        t = st.gpu_results.pop(cid, None)
+        if t is None:
+            continue
+        img = ts.output(cid)
+        if img is not None and tuple(img.size) == (t.w, t.h):
+            rgba = read_texture(t.tex, 4)
+            if not rgba.flags.writeable:
+                rgba = rgba.copy()
+            rgba[..., :3] = finalize(BY_ID_[cid], rgba[..., :3])
+            rgba[..., 3] = 1.0
+            out[cid] = rgba
+        gc.release(t)
+    return out
 
 
 def sync_all():
@@ -794,12 +909,13 @@ def _schedule(mat, key):
     _pending.setdefault(mat.name, set()).add(key)
 
 
-def request(mat, uid=None, channel=None):
+def request(mat, uid=None, channel=None, blend_only=False):
     """Schedule a composite. uid: the layer that changed (None = texture-set wide,
-    which drops the material's cache); channel: the only channel it affects."""
+    which drops the material's cache); channel: the only channel it affects;
+    blend_only: see invalidate."""
     if not mat.paintstack.initialized:
         return
-    invalidate(mat, uid, channel)
+    invalidate(mat, uid, channel, blend_only and uid is not None)
     _schedule(mat, (uid, channel))
 
 

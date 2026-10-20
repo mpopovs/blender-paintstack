@@ -34,7 +34,7 @@ sys.path.insert(0, HERE)
 import bpy  # noqa: E402
 
 SUITES = ["test_headless", "test_phase2", "test_phase2_extras", "test_phase3", "test_phase4",
-          "test_phase5", "test_phase6", "test_phase7"]
+          "test_phase5", "test_phase6", "test_phase7", "test_phase8"]
 
 
 def _args():

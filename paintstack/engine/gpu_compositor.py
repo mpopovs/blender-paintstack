@@ -51,6 +51,8 @@ vec3 blend(vec3 b, vec3 s, int mode)
   return s;
 }
 
+/* params = (opacity, blend mode, source is a texture, source alpha is coverage),
+   params2.x = has a mask texture. */
 void main()
 {
   ivec2 p = ivec2(gl_FragCoord.xy);
@@ -58,6 +60,9 @@ void main()
   vec4 lay = texelFetch(layerTex, p, 0);
   vec3 src = (params.z > 0.5) ? lay.rgb : constSrc.rgb;
   float a = ((params.w > 0.5) ? lay.a : 1.0) * params.x;
+  if (params2.x > 0.5) {
+    a *= texelFetch(maskTex, p, 0).r;
+  }
   vec3 o = blend(base, src, int(params.y + 0.5));
   fragColor = vec4(base + (o - base) * a, 1.0);
 }
@@ -213,7 +218,8 @@ void main()
 """
 
 _SPECS = {
-    "blend": (_BLEND, ["baseTex", "layerTex"], [("VEC4", "constSrc"), ("VEC4", "params")]),
+    "blend": (_BLEND, ["baseTex", "layerTex", "maskTex"],
+              [("VEC4", "constSrc"), ("VEC4", "params"), ("VEC4", "params2")]),
     "fade": (_FADE, ["baseTex", "innerTex", "maskTex"], [("VEC4", "params")]),
     "blur": (_BLUR, ["src"], [("VEC4", "params")]),
     "sharpen": (_SHARPEN, ["baseTex", "blurTex"], [("VEC4", "params")]),
@@ -324,35 +330,55 @@ class GPUCompositor:
     def read(self, t):
         return read_texture(t.tex, 4)[..., :3].copy()
 
+    def write_region(self, t, y0, x0, rgba):
+        """Paste an (h, w, 4) array into a target at (y0, x0)."""
+        from .live import _blit
+        _blit(t.tex, 0, x0, y0, np.ascontiguousarray(rgba, np.float32))
+
+    def read_region(self, t, y0, y1, x0, x1):
+        """(y1 - y0, x1 - x0, 4) block of a target."""
+        from .projector import buffer_array
+        with t.fb.bind():
+            buf = gpu.state.active_framebuffer_get().read_color(x0, y0, x1 - x0, y1 - y0, 4, 0, "FLOAT")
+        return buffer_array(buf, (y1 - y0) * (x1 - x0) * 4).reshape(y1 - y0, x1 - x0, 4)
+
     # Operations
 
-    def blend(self, base, entry, key):
-        src, alpha, mode = entry
-        src_tex, alpha_tex = np.ndim(src) >= 2, np.ndim(alpha) >= 2
-        layer = _white()
-        if src_tex or alpha_tex:
-            h, w = base.h, base.w
+    def mask_texture(self, mask, key):
+        """One-channel upload of a layer mask, shared by every channel's blend."""
+        if np.ndim(mask) < 2:
+            return None
+        return self.upload(key, [mask], lambda: mask, "R16F")
 
-            def build():
-                rgb = src if src_tex else np.zeros((h, w, 3), np.float32)
-                a = alpha if alpha_tex else np.ones((h, w), np.float32)
-                return np.concatenate([rgb, a[..., None]], -1)
-            layer = self.upload(key, [src if src_tex else None, alpha if alpha_tex else None], build)
-        const = tuple(np.broadcast_to(src, (3,))) if not src_tex else (0.0, 0.0, 0.0)
-        scalar = 1.0 if alpha_tex else float(alpha)
-        out = self.op("blend", (base.w, base.h), (base.tex, layer),
+    def blend(self, base, parts):
+        """Blend one layer channel (compositor.Parts) onto base."""
+        src = parts.src
+        src_tex = np.ndim(src) >= 2
+        layer = _white()
+        if src_tex:
+            if src.shape[-1] == 4:  # painted pixels: upload as they are
+                layer = self.upload(parts.src_key, [src], lambda: src)
+            else:
+                layer = self.upload(parts.src_key, [src], lambda: np.concatenate(
+                    [src, np.ones(src.shape[:2] + (1,), np.float32)], -1))
+        mask = self.mask_texture(parts.mask, parts.mask_key) if parts.mask is not None else None
+        scale = parts.scale * (1.0 if mask is not None or parts.mask is None else float(parts.mask))
+        const = tuple(np.broadcast_to(np.asarray(src, np.float32), (3,))) if not src_tex else (0.0, 0.0, 0.0)
+        out = self.op("blend", (base.w, base.h), (base.tex, layer, mask if mask is not None else _white()),
                       constSrc=(*const, 0.0),
-                      params=(scalar, float(BLEND_IDS.get(mode, 0)), float(src_tex), float(alpha_tex)))
+                      params=(scale, float(BLEND_IDS.get(parts.mode, 0)), float(src_tex),
+                              float(parts.src_alpha)),
+                      params2=(float(mask is not None), 0.0, 0.0, 0.0))
         self.release(base)
         return out
 
-    def fade(self, base, inner, alpha, key):
-        alpha_tex = np.ndim(alpha) >= 2
-        mask = _white()
-        if alpha_tex:
-            mask = self.upload(key, [alpha], lambda: np.ascontiguousarray(alpha, np.float32), "R16F")
-        out = self.op("fade", (base.w, base.h), (base.tex, inner.tex, mask),
-                      params=(1.0 if alpha_tex else float(alpha), float(alpha_tex), 0.0, 0.0))
+    def fade(self, base, inner, scale, mask=None, mask_key=None):
+        """base + (inner - base) * scale * mask."""
+        mtex = self.mask_texture(mask, mask_key) if mask is not None else None
+        if mask is not None and mtex is None:
+            scale *= float(mask)
+        out = self.op("fade", (base.w, base.h), (base.tex, inner.tex, mtex if mtex is not None else _white()),
+                      params=(float(scale), float(mtex is not None), 0.0, 0.0))
         self.release(base)
         self.release(inner)
         return out

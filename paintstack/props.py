@@ -100,15 +100,25 @@ def _recomposite(self, context):
         compositor.request(mat, *_owner(self))
 
 
+def _reblend(self, context):
+    """Property update for values that only change how a layer is blended
+    (opacity, colour, blend mode, visibility): its cached pixels, mask and
+    uploaded textures stay valid, so dragging these sliders stays cheap."""
+    from . import compositor
+    mat = self.id_data
+    if isinstance(mat, bpy.types.Material):
+        compositor.request(mat, *_owner(self), blend_only=True)
+
+
 class PS_LayerChannel(PropertyGroup):
     channel: EnumProperty(items=CHANNEL_ITEMS)
-    enabled: BoolProperty(default=True, update=_recomposite)
-    blend_mode: EnumProperty(items=BLEND_MODES, default="NORMAL", update=_recomposite)
-    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_recomposite)
+    enabled: BoolProperty(default=True, update=_reblend)
+    blend_mode: EnumProperty(items=BLEND_MODES, default="NORMAL", update=_reblend)
+    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_reblend)
     # Fill layer values
     color: FloatVectorProperty(subtype="COLOR_GAMMA", size=3, min=0.0, max=1.0,
-                               default=(0.8, 0.8, 0.8), update=_recomposite)
-    value: FloatProperty(min=0.0, max=1.0, default=0.5, subtype="FACTOR", update=_recomposite)
+                               default=(0.8, 0.8, 0.8), update=_reblend)
+    value: FloatProperty(min=0.0, max=1.0, default=0.5, subtype="FACTOR", update=_reblend)
     # Fill layer texture (overrides color / value when set)
     texture: PointerProperty(type=bpy.types.Image, update=_recomposite)
     # Paint layer content (RGBA, alpha = coverage)
@@ -179,7 +189,7 @@ class PS_Layer(PropertyGroup):
     warp_scale: FloatProperty(name="Warp Scale", min=0.1, max=100.0, default=8.0, update=_recomposite)
     parent_uid: StringProperty(description="uid of the folder containing this layer ('' = root)")
     expanded: BoolProperty(default=True)
-    visible: BoolProperty(default=True, update=_recomposite)
+    visible: BoolProperty(default=True, update=_reblend)
     projection: EnumProperty(
         name="Projection",
         items=[("UV", "UV", "Tile fill textures in UV space"),
@@ -187,7 +197,7 @@ class PS_Layer(PropertyGroup):
                                            "Position and World Normal maps (no UV seams)")],
         update=_recomposite)
     tiling: FloatProperty(name="Tiling", min=0.01, max=100.0, default=1.0, update=_recomposite)
-    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_recomposite)
+    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_reblend)
     channels: CollectionProperty(type=PS_LayerChannel)
 
     mask_image: PointerProperty(type=bpy.types.Image)

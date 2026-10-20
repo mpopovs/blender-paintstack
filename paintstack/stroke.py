@@ -30,7 +30,6 @@ class Stroke:
         px_scale: physical pixels per UI pixel (2 on Retina); brush sizes are UI pixels.
         live: write stroke regions straight into the viewport's GPU textures
         (None = the add-on preference)."""
-        compositor.sync_outputs(mat)  # strokes start from the CPU images
         self.px_scale = px_scale
         self.live = hardware.live_preview_enabled() if live is None else live
         self.live_channels = set()
@@ -96,6 +95,14 @@ class Stroke:
         self.anchors = bool(compositor.anchor_channels(ts))
         self.pad = compositor.filter_reach(ts)
         self.outputs = {}
+        # Composites still only on the GPU are not synced to the CPU images first.
+        # With the live preview, the stroke keeps them as GPU targets (sinks) and
+        # pastes its regions into them; otherwise it takes them as arrays. Either
+        # way the images are written once, after the stroke.
+        used = [c.id for c in (enabled_channels(ts) if self.anchors else self.channels)]
+        self.sinks = compositor.take_gpu_targets(mat, used) if self.live else {}
+        self.outputs.update(compositor.take_gpu_outputs(mat, used))
+        self.unsynced = set(self.outputs)
 
         undo.push(mat, {t.image.name: t.orig for t in self.targets})
 
@@ -185,6 +192,20 @@ class Stroke:
                 np.round(cur * 255.0, out=cur)
                 cur /= 255.0
 
+    def _gpu(self):
+        from .engine import gpu_compositor
+        return gpu_compositor.instance()
+
+    def _drop_sinks(self):
+        """Turn GPU sinks back into output arrays (live preview failed)."""
+        gc = self._gpu()
+        for cid, t in self.sinks.items():
+            rgba = gc.read_region(t, 0, t.h, 0, t.w)
+            self.outputs[cid] = rgba if rgba.flags.writeable else rgba.copy()
+            self.unsynced.add(cid)
+            gc.release(t)
+        self.sinks = {}
+
     def _output(self, ch):
         """Full RGBA output array, kept for the stroke and pasted into per region."""
         if ch.id not in self.outputs:
@@ -234,30 +255,47 @@ class Stroke:
                     for ch in channels}
             iy, ix = slice(y0 - wy0, y1 - wy0), slice(x0 - wx0, x1 - wx0)
             for ch in channels:
-                self._output(ch)[y0:y1, x0:x1, :3] = compositor.finalize(ch, results[ch.id][iy, ix])
+                rgb = compositor.finalize(ch, results[ch.id][iy, ix])
+                if ch.id in self.sinks:
+                    rgba = np.concatenate([rgb, np.ones(rgb.shape[:2] + (1,), np.float32)], -1)
+                    self._gpu().write_region(self.sinks[ch.id], y0, x0, rgba)
+                else:
+                    self._output(ch)[y0:y1, x0:x1, :3] = rgb
 
         if self.live:
             try:
                 from .engine import live
                 for ch in channels:
                     for region in regions:
-                        live.push(self.ts.output(ch.id), self._output(ch), region)
-                    self.live_channels.add(ch.id)
+                        if ch.id in self.sinks:
+                            ay0, ay1, ax0, ax1, levels = live.aligned(region, res)
+                            block = self._gpu().read_region(self.sinks[ch.id], ay0, ay1, ax0, ax1)
+                            live.push_block(self.ts.output(ch.id), block, ay0, ax0, levels)
+                        else:
+                            live.push(self.ts.output(ch.id), self._output(ch), region)
+                    if ch.id not in self.sinks:
+                        self.live_channels.add(ch.id)
             except Exception as e:  # unsupported backend / format: fall back for good
                 print(f"PaintStack: GPU live preview disabled ({e})")
                 self.live = False
+                self._drop_sinks()
         if not self.live:
             for ch in channels:
                 pixels.write(self.ts.output(ch.id), self._output(ch))
+                self.unsynced.discard(ch.id)
         if self.ts.view_mode == "MASK":
             compositor.write_mask_view(self.mat, self.cache, overrides)
 
     def finish(self):
         self.update()
         # The live preview only touched GPU textures: store the outputs once.
-        for cid in self.live_channels:
+        for cid in self.live_channels | self.unsynced:
             pixels.write(self.ts.output(cid), self.outputs[cid])
         self.live_channels.clear()
+        self.unsynced.clear()
+        for cid, t in self.sinks.items():
+            compositor.give_gpu_target(self.mat, cid, t)
+        self.sinks = {}
         # Layer images are written once, at the end of the stroke; the cache keeps
         # the new pixels so the next composite does not have to read them back.
         uid = self.layer.uid
