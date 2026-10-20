@@ -550,7 +550,8 @@ def _pref(name, default):
 
 
 def use_gpu(ts):
-    """GPU compositing: requested (or Auto on a hardware GPU), and no anchors."""
+    """GPU compositing: requested (or Auto on a hardware GPU that passes the probe),
+    and no anchors."""
     if anchor_channels(ts):
         return False
     mode = BACKEND_OVERRIDE or _pref("compositor_backend", "AUTO")
@@ -558,7 +559,14 @@ def use_gpu(ts):
         return False
     if mode == "AUTO" and not hardware.gpu_is_hardware():
         return False
-    return hardware.gpu_backend() != "NONE"
+    if hardware.gpu_backend() == "NONE":
+        return False
+    if mode == "AUTO":
+        # Auto only picks the GPU where its basic operations check out (see
+        # Diagnostics); forcing "GPU" in the preferences skips this.
+        from .engine import gpu_probe
+        return gpu_probe.supports(gpu_probe.COMPOSITOR_NEEDS)
+    return True
 
 
 def _deferred():
@@ -666,7 +674,11 @@ def sync_outputs(mat):
     gc = gpu_compositor.instance()
     ts = mat.paintstack
     for cid, t in st.gpu_results.items():
-        write_output(ts, BY_ID_[cid], gc.read(t))
+        img = ts.output(cid)
+        # A result composited before a resolution change is stale: the resized
+        # image gets recomposited instead.
+        if img is not None and tuple(img.size) == (t.w, t.h):
+            write_output(ts, BY_ID_[cid], gc.read(t))
         gc.release(t)
     st.gpu_results = {}
 

@@ -224,7 +224,24 @@ def main():
     ts.active_layer.active_mask_effect.anchor_uid = uid
     compositor.BACKEND_OVERRIDE = "GPU"
     check(not compositor.use_gpu(ts), "stacks with anchors use the CPU compositor")
-    compositor.BACKEND_OVERRIDE = None
+    ts.layers.remove(ts.active_layer_index)
+    top.is_anchor = False
+
+    # A GPU result still waiting for its CPU sync when the resolution changes is
+    # stale: syncing must drop it, not write it into the resized image.
+    compositor.DEFER_OVERRIDE = True
+    compositor.composite(mat)
+    old = ts.res
+    ts.resolution = str(old * 2)
+    try:
+        compositor.invalidate_all()
+        ok = True
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        print(e)
+    check(ok and tuple(ts.output("BASE_COLOR").size) == (old * 2, old * 2),
+          "pending GPU result from before a resolution change is dropped")
+    compositor.BACKEND_OVERRIDE = compositor.DEFER_OVERRIDE = None
 
     print("FAILED" if check.failed else "ALL PASSED")
     sys.exit(1 if check.failed else 0)

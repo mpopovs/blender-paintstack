@@ -5,6 +5,7 @@
 #   sh tests/run_on_mac.sh                      # uses /Applications/Blender.app
 #   sh tests/run_on_mac.sh ~/Apps/Blender.app   # or another Blender
 #   sh tests/run_on_mac.sh "" --no-bench        # skip the (slow) benchmark
+#   sh tests/run_on_mac.sh "" --diag            # only Diagnostics (GPU checks), ~30 s
 #
 # Every step opens its own Blender window with a fresh factory setup (your
 # preferences, add-ons and open files are not touched) and closes it when done.
@@ -20,7 +21,11 @@ if [ ! -x "$BLENDER" ]; then
   exit 1
 fi
 BENCH=1
-for a in "$@"; do [ "$a" = "--no-bench" ] && BENCH=0; done
+DIAG_ONLY=0
+for a in "$@"; do
+  [ "$a" = "--no-bench" ] && BENCH=0
+  [ "$a" = "--diag" ] && DIAG_ONLY=1
+done
 
 REPORT="$HOME/Desktop/paintstack_report.txt"
 [ -d "$HOME/Desktop" ] || REPORT="$HOME/paintstack_report.txt"
@@ -30,6 +35,7 @@ mkdir -p "$OUT"
 
 STEPS="info test_headless test_phase2 test_phase2_extras test_phase3 test_phase4 test_phase5 test_phase6 test_phase7 diagnostics"
 [ $BENCH = 1 ] && STEPS="$STEPS bench-cpu bench-gpu"
+[ $DIAG_ONLY = 1 ] && STEPS="info diagnostics"
 
 echo "Testing with: $("$BLENDER" --version 2>/dev/null | head -1)"
 echo "Each step opens a Blender window that closes by itself. Logs: $OUT"

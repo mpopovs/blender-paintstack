@@ -59,6 +59,59 @@ def _expected_dab(res, view, cx, cy, radius):
     return np.hypot(sx - cx, sy - cy) < radius
 
 
+_DAB_STAGES = ("behind the camera", "outside the square tip", "outside the round tip", "outside the stencil",
+               "zero tip shape", "hidden by the depth prepass", "facing away", "painted")
+
+
+def _dab_debug(r, proj, view, ref):
+    """Why the dab shader rejects texels: a copy of it that writes, per texel, the
+    number of the test that discarded it instead of discarding."""
+    import gpu
+    from .engine import shaders
+    from .engine.projector import _white, read_texture
+    frag = shaders._DAB_FRAG
+    for k in range(1, 8):
+        frag = frag.replace("discard;", f"fragColor = vec4({k}.0, 0.0, 0.0, 1.0); return;", 1)
+    frag = frag.replace("fragColor = vec4(1.0, 1.0, 1.0, shape", "fragColor = vec4(8.0, 0.0, 0.0, 1.0); return;\n  fragColor = vec4(1.0, 1.0, 1.0, shape")
+    try:
+        sh = shaders._create("ps_dab_debug", [("VEC3", "pos"), ("VEC2", "uv"), ("VEC3", "nor")],
+                             [("VEC3", "wpos"), ("VEC3", "wnor")], shaders._UV_VERT, frag,
+                             (("VEC4", "brush"), ("VEC4", "dab")),
+                             samplers=[(0, "depthTex"), (1, "tipTex"), (2, "stencilTex")], view_ubo=True)
+        proj.begin_view(*view)
+        proj.set_tip(None)
+        res = proj.res
+        off = gpu.types.GPUOffScreen(res, res, format="RGBA32F")
+        try:
+            with off.bind():
+                gpu.state.active_framebuffer_get().clear(color=(0.0, 0.0, 0.0, 0.0))
+                gpu.state.blend_set("NONE")
+                sh.bind()
+                sh.uniform_block("vp", proj.ubo)
+                sh.uniform_sampler("depthTex", proj.depth.texture_color)
+                sh.uniform_sampler("tipTex", _white())
+                sh.uniform_sampler("stencilTex", _white())
+                sh.uniform_float("brush", (W / 2, H / 2, 40, 1.0))
+                sh.uniform_float("dab", (0.0, 1.0, 0.0, 0.0))
+                proj.uv_batch.draw(sh)
+                for name in ("depthTex", "tipTex", "stencilTex"):
+                    sh.uniform_sampler(name, _white())
+            codes = np.rint(read_texture(off.texture_color)).astype(int)
+        finally:
+            off.free()
+        depth = read_texture(proj.depth.texture_color)
+        hit = depth < 1e8
+        r.info(f"depth prepass: {hit.mean():.0%} of pixels hit, depth {depth[hit].min() if hit.any() else 0:.3g}"
+               f"..{depth[hit].max() if hit.any() else 0:.3g} (want about 18% and 5)")
+        for label, sel in (("inside the brush", ref), ("whole texture", codes >= 0)):
+            hist = np.bincount(codes[sel].ravel(), minlength=9)
+            parts = [f"{'not drawn' if k == 0 else _DAB_STAGES[k - 1]} {hist[k] / max(sel.sum(), 1):.0%}"
+                     for k in range(9) if hist[k]]
+            r.info(f"dab texels {label}: " + ", ".join(parts))
+    except Exception as e:  # noqa: BLE001
+        r.info(f"dab debug failed: {type(e).__name__}: {str(e)[:200]}")
+
+
 class Report:
     def __init__(self):
         self.lines, self.failures = [], 0
@@ -91,6 +144,12 @@ def run():
         except Exception as e:
             r.check(False, f"shader '{name}' compiles", str(e)[:200])
 
+    # Raw GPU operations; "DIFF" marks a result that differs from OpenGL.
+    from .engine import gpu_probe
+    r.info("GPU probe:")
+    for name, ok, detail in gpu_probe.run():
+        r.info(f"  {'ok  ' if ok else 'DIFF'}  {name}: {detail}")
+
     res = 512
     pos, nor, uv = _plane()
     proj = Projector.from_arrays(pos, nor, uv, res)
@@ -110,6 +169,8 @@ def run():
     ref = _expected_dab(res, view, W / 2, H / 2, 40)
     iou = (m & ref).sum() / max((m | ref).sum(), 1)
     r.check(iou > 0.97, "dab projection matches the CPU reference", f"IoU {iou:.3f}")
+    if iou <= 0.97:
+        _dab_debug(r, proj, view, ref)
 
     # Blending into the half-float stroke mask accumulates ("over")
     v = dab((W / 2, H / 2, 40, 1.0, 0.5, 0.0), (W / 2, H / 2, 40, 1.0, 0.5, 0.0))
@@ -252,7 +313,9 @@ def _compositor_checks(r, res=2048):
         r.check(not fell_back and worst <= 1.0 / 255 + 2e-3, "GPU compositor matches the CPU compositor",
                 f"max diff {worst:.4f}")
         r.info(f"{res}px composite, 5 layers + blur: CPU {cpu_ms:.0f} ms, GPU {gpu_ms:.0f} ms")
-        r.info(f"Auto compositor here: {'GPU' if hardware.gpu_is_hardware() else 'CPU'}")
+        from .engine import gpu_probe
+        auto_gpu = hardware.gpu_is_hardware() and gpu_probe.supports(gpu_probe.COMPOSITOR_NEEDS)
+        r.info(f"Auto compositor here: {'GPU' if auto_gpu else 'CPU'}")
     finally:
         compositor.BACKEND_OVERRIDE = None
         compositor.FORCE_SYNC = False
