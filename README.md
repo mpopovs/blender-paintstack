@@ -6,6 +6,10 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *One stroke paints Base Color, Roughness, Metallic and Height together (gold swirl = metallic and raised, red = glossy and recessed).*
 
+![Smart materials](docs/smart_materials.png)
+
+*Built-in smart materials (Painted Steel, Rusty Iron, Worn Gold, Dusty Plastic), each applied with one click. Every one adapts to its own mesh's baked curvature, AO and position.*
+
 ![Phase 3 brushes](docs/phase3.png)
 
 *Phase 3 brushes: stripes painted through a stencil, a Scratches tip, Dirt Splatter, a Square tip that follows the stroke, and a hammered-metal normal fill projected tri-planar (no UV seams).*
@@ -14,7 +18,19 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.3)
+## Features (v0.4)
+
+### Phase 4: smart assets
+- **Smart materials**: 7 built-in (Painted Steel, Rusty Iron, Worn Gold, Dusty Plastic, Concrete, Chrome, Rubber). Each is applied as a folder above the active layer, and its generators re-bind to the target mesh's baked maps
+- **Smart masks**: 7 built-in (Edge Wear, Dirt, Top Dust, Rust Spots, Leaks, Scratches, Cracks), appended to the active layer's mask stack
+- **Save your own**: any layer or folder can be saved as a smart material, and any mask stack as a smart mask. Assets are saved as `.blend` files (painted pixels included) in a **PaintStack** library that is registered in Blender's **Asset Browser**
+- **Grunge library**: 8 seamless procedural textures (Grunge, Dust, Rust Spots, Leaks, Scratches, Concrete, Cells, Cracks), usable as a **Grunge** mask generator (tri-planar when Position is baked), a fill texture, a stencil or a brush tip
+- **Filter layers**: Blur, Sharpen, Hue/Saturation/Lightness and Warp. A filter applies to everything below it, per channel, with opacity and a mask
+- **Anchor points**: tick a layer as an anchor, and an **Anchor** mask effect elsewhere can use that layer's result. For example, rust where you painted height. Painted strokes update the dependent layers live
+- Fixes: duplicating a layer, or saving painted layers into an asset, no longer loses painted pixels (`Image.copy()` regenerates unsaved generated images)
+
+![Grunge library](docs/grunge.png)
+
 
 ### Phase 3: painter UX
 - **Brush tips**: Round, Square, Splatter, Noise, Scratches, or any image. Tips can be set to an angle or follow the stroke
@@ -72,7 +88,7 @@ In Blender, go to **Edit → Preferences → Get Extensions → ⌄ → Install 
 2. Click **Create Texture Set**. This creates a "Base Material" fill layer and a "Paint 1" layer.
 3. Switch the viewport to **Material Preview**.
 4. Under **Brush**, choose the channels to paint and their values, then click **Start Painting**.
-5. For smart masks, open **Bake Mesh Maps**, optionally set a **High Poly** object, and click **Bake**. Then add a fill layer and use **+** in its mask stack to add **Edge Wear**, **Dirt** and other generators.
+5. For smart materials and masks, open **Bake Mesh Maps**, optionally set a **High Poly** object, and click **Bake**. Then add a fill layer and use **+** in its mask stack to add **Edge Wear**, **Dirt** and other generators, or pick one from **Smart Assets → Smart Material / Smart Mask**.
 
 | Key (in paint mode) | Action |
 |---|---|
@@ -99,6 +115,9 @@ paintstack/
   stack.py          layer folders: contiguous blocks in the flat list, tree, moves
   brushes.py        brush tips and the preset library
   fills.py          fill-layer textures: UV tiling and tri-planar projection
+  grunge.py         seamless procedural grunge library
+  filters.py        filter layers: blur, sharpen, HSL, warp
+  smart.py          smart materials / masks: built-in recipes, .blend asset library
   masks.py          mask stack evaluation (paint / fill / generators / levels / blur)
   generators.py     edge wear, dirt, curvature, AO, thickness, position, 3D noise
   baker.py          Cycles mesh-map baker (stepwise BakeJob, modal operator)
@@ -127,6 +146,9 @@ python tests/test_phase2.py    # Phase 2: high->low bake, every map, generators,
 python tests/test_phase2_extras.py  # ID by material, ray pick + colour selection, cage, cancelled jobs, GPU noise
 python tests/test_phase3.py    # tips, rotation, stencil, jitter, lazy, lines, presets, normals, fills, folders, views
 python tests/demo_phase3.py docs/phase3.png
+python tests/test_phase4.py    # grunge, filters, anchors, built-in + saved smart materials / masks
+python tests/demo_phase4.py docs/smart_materials.png
+python tests/demo_grunge.py docs/grunge.png
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render
 ```

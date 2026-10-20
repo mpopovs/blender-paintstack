@@ -13,7 +13,7 @@ class PaintStackPanel:
     bl_category = "PaintStack"
 
 
-LAYER_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "IMAGE_RGB", "FOLDER": "FILE_FOLDER"}
+LAYER_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "IMAGE_RGB", "FOLDER": "FILE_FOLDER", "FILTER": "FILTER"}
 
 
 class PAINTSTACK_UL_layers(UIList):
@@ -26,6 +26,8 @@ class PAINTSTACK_UL_layers(UIList):
                      icon="DISCLOSURE_TRI_DOWN" if layer.expanded else "DISCLOSURE_TRI_RIGHT")
         row.label(text="", icon=LAYER_ICONS[layer.type])
         row.prop(layer, "name", text="", emboss=False)
+        if layer.is_anchor:
+            row.label(text="", icon="PINNED")
         if layer.has_mask:
             row.label(text="", icon="MOD_MASK" if layer.edit_target == "MASK" else "SELECT_SET")
         row.prop(layer, "visible", text="", emboss=False,
@@ -40,7 +42,7 @@ class PAINTSTACK_UL_layers(UIList):
 
 
 EFFECT_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "SNAP_FACE", "LEVELS": "FILTER", "BLUR": "FILTER",
-                "ID_MASK": "EYEDROPPER"}
+                "ID_MASK": "EYEDROPPER", "GRUNGE": "IMAGE_DATA", "ANCHOR": "PINNED"}
 
 
 class PAINTSTACK_UL_mask_effects(UIList):
@@ -59,13 +61,25 @@ class PAINTSTACK_UL_mask_effects(UIList):
         return [], [n - 1 - i for i in range(n)]
 
 
+class PAINTSTACK_MT_anchors(bpy.types.Menu):
+    bl_label = "Anchor Layers"
+
+    def draw(self, context):
+        _, ts = ops.texture_set(context)
+        anchors = [l for l in ts.layers if l.is_anchor] if ts else []
+        if not anchors:
+            self.layout.label(text="No anchor layers")
+        for l in anchors:
+            self.layout.operator("paintstack.effect_set_anchor", text=l.name, icon="PINNED").uid = l.uid
+
+
 class PAINTSTACK_MT_add_effect(bpy.types.Menu):
     bl_label = "Add Mask Effect"
 
     def draw(self, context):
         layout = self.layout
         for ident, label, _ in EFFECT_TYPES:
-            if ident in ("LEVELS", "PAINT", "ID_MASK"):
+            if ident in ("LEVELS", "PAINT", "ID_MASK", "GRUNGE"):
                 layout.separator()
             layout.operator("paintstack.effect_add", text=label,
                             icon=EFFECT_ICONS.get(ident, "TEXTURE")).type = ident
@@ -93,6 +107,25 @@ def draw_effect(layout, effect, ts):
         col.prop(effect, "gamma")
     elif t == "BLUR":
         col.prop(effect, "blur_radius")
+    elif t == "ANCHOR":
+        lookup = stack.by_uid(ts)
+        anchor = lookup.get(effect.anchor_uid)
+        col = layout.column(align=True)
+        col.menu("PAINTSTACK_MT_anchors", text=anchor.name if anchor else "Choose Anchor…", icon="PINNED")
+        col.prop(effect, "anchor_channel")
+        col.prop(effect, "level")
+        col.prop(effect, "softness")
+        if not any(l.is_anchor for l in ts.layers):
+            layout.label(text="Tick 'Anchor Point' on a layer first", icon="INFO")
+    elif t == "GRUNGE":
+        col = layout.column(align=True)
+        col.prop(effect, "grunge")
+        col.prop(effect, "grunge_tiling")
+        col.prop(effect, "seed")
+        col.prop(effect, "level")
+        col.prop(effect, "softness")
+        if ts.baked_map("POSITION") is None or ts.baked_map("WORLD_NORMAL") is None:
+            layout.label(text="Bake Position + World Normal for seamless tri-planar", icon="INFO")
     elif t == "ID_MASK":
         col = layout.column(align=True)
         row = col.row(align=True)
@@ -165,6 +198,7 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
         col.operator("paintstack.layer_add", text="", icon="BRUSH_DATA").type = "PAINT"
         col.operator("paintstack.layer_add", text="", icon="IMAGE_RGB").type = "FILL"
         col.operator("paintstack.layer_add", text="", icon="FILE_FOLDER").type = "FOLDER"
+        col.operator("paintstack.layer_add", text="", icon="FILTER").type = "FILTER"
         col.operator("paintstack.layer_duplicate", text="", icon="DUPLICATE")
         col.operator("paintstack.layer_remove", text="", icon="REMOVE")
         col.separator()
@@ -177,7 +211,9 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
         layer = ts.active_layer
         if layer is None:
             return
-        layout.prop(layer, "opacity")
+        row = layout.row()
+        row.prop(layer, "opacity")
+        row.prop(layer, "is_anchor", text="", icon="PINNED")
 
         box = layout.box()
         if layer.has_mask:
@@ -209,6 +245,25 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
 
         if layer.type == "FOLDER":
             layout.label(text="Folder: opacity and mask apply to its contents", icon="INFO")
+            return
+        if layer.type == "FILTER":
+            box = layout.box()
+            box.prop(layer, "filter_type")
+            col = box.column(align=True)
+            if layer.filter_type in ("BLUR", "SHARPEN"):
+                col.prop(layer, "filter_radius")
+            if layer.filter_type in ("SHARPEN", "WARP"):
+                col.prop(layer, "filter_amount")
+            if layer.filter_type == "WARP":
+                col.prop(layer, "warp_scale")
+            if layer.filter_type == "HSL":
+                col.prop(layer, "hue")
+                col.prop(layer, "saturation")
+                col.prop(layer, "lightness")
+            row = box.row(align=True)
+            for ch in enabled_channels(ts):
+                lc = layer.channel(ch.id)
+                row.prop(lc, "enabled", text=ch.label, toggle=True)
             return
         box = layout.box()
         if layer.type == "FILL":
@@ -338,6 +393,85 @@ class PAINTSTACK_PT_brush_stencil(PaintStackPanel, Panel):
         layout.label(text="In paint mode: hold S and move / wheel / Ctrl+wheel", icon="INFO")
 
 
+class PAINTSTACK_MT_smart(bpy.types.Menu):
+    bl_label = "Smart Assets"
+    kind = "SMART_MATERIAL"
+
+    def draw(self, context):
+        from . import smart
+        layout = self.layout
+        builtins = smart.SMART_MATERIALS if self.kind == "SMART_MATERIAL" else smart.SMART_MASKS
+        for name in builtins:
+            op = layout.operator("paintstack.smart_apply", text=name)
+            op.kind, op.name, op.path = self.kind, name, ""
+        user = smart.user_assets(self.kind)
+        if user:
+            layout.separator()
+            for name, path in user.items():
+                op = layout.operator("paintstack.smart_apply", text=name, icon="ASSET_MANAGER")
+                op.kind, op.name, op.path = self.kind, name, path
+
+
+class PAINTSTACK_MT_smart_materials(PAINTSTACK_MT_smart):
+    bl_label = "Smart Materials"
+    kind = "SMART_MATERIAL"
+
+
+class PAINTSTACK_MT_smart_masks(PAINTSTACK_MT_smart):
+    bl_label = "Smart Masks"
+    kind = "SMART_MASK"
+
+
+class PAINTSTACK_MT_smart_delete(bpy.types.Menu):
+    bl_label = "Delete Saved Asset"
+
+    def draw(self, context):
+        from . import smart
+        layout = self.layout
+        found = False
+        for kind in (smart.KIND_MATERIAL, smart.KIND_MASK):
+            for name, path in smart.user_assets(kind).items():
+                layout.operator("paintstack.smart_delete", text=name, icon="TRASH").path = path
+                found = True
+        if not found:
+            layout.label(text="No saved assets")
+
+
+class PAINTSTACK_MT_grunge(bpy.types.Menu):
+    bl_label = "Grunge Library"
+
+    def draw(self, context):
+        from .grunge import GRUNGE_TYPES
+        layout = self.layout
+        for use_as, label in (("STENCIL", "As Stencil"), ("TIP", "As Brush Tip"), ("IMAGE", "As Image")):
+            layout.label(text=label)
+            for ident, name, _ in GRUNGE_TYPES:
+                op = layout.operator("paintstack.grunge_image", text=name)
+                op.kind, op.use_as = ident, use_as
+            layout.separator()
+
+
+class PAINTSTACK_PT_smart(PaintStackPanel, Panel):
+    bl_label = "Smart Assets"
+    bl_parent_id = "PAINTSTACK_PT_main"
+
+    @classmethod
+    def poll(cls, context):
+        return ops.texture_set(context)[0] is not None
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.menu("PAINTSTACK_MT_smart_materials", text="Smart Material", icon="MATERIAL")
+        row.menu("PAINTSTACK_MT_smart_masks", text="Smart Mask", icon="MOD_MASK")
+        row = layout.row(align=True)
+        row.operator("paintstack.smart_save", text="Save Material", icon="ADD").kind = "SMART_MATERIAL"
+        row.operator("paintstack.smart_save", text="Save Mask", icon="ADD").kind = "SMART_MASK"
+        row.menu("PAINTSTACK_MT_smart_delete", text="", icon="TRASH")
+        layout.menu("PAINTSTACK_MT_grunge", icon="IMAGE_DATA")
+        layout.label(text="Saved assets also appear in the Asset Browser ('PaintStack')", icon="INFO")
+
+
 class PAINTSTACK_PT_bake(PaintStackPanel, Panel):
     bl_label = "Bake Mesh Maps"
     bl_parent_id = "PAINTSTACK_PT_main"
@@ -392,6 +526,8 @@ class PAINTSTACK_PT_export(PaintStackPanel, Panel):
 
 
 classes = (PAINTSTACK_UL_layers, PAINTSTACK_UL_mask_effects, PAINTSTACK_MT_add_effect,
-           PAINTSTACK_MT_brush_presets, PAINTSTACK_PT_main, PAINTSTACK_PT_layers,
+           PAINTSTACK_MT_brush_presets, PAINTSTACK_MT_anchors, PAINTSTACK_MT_smart_materials,
+           PAINTSTACK_MT_smart_masks, PAINTSTACK_MT_smart_delete, PAINTSTACK_MT_grunge,
+           PAINTSTACK_PT_main, PAINTSTACK_PT_layers, PAINTSTACK_PT_smart,
            PAINTSTACK_PT_brush, PAINTSTACK_PT_brush_tip, PAINTSTACK_PT_brush_stencil,
            PAINTSTACK_PT_bake, PAINTSTACK_PT_export)

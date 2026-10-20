@@ -50,7 +50,7 @@ class Stroke:
         from . import ops
         erase = brush.mode == "ERASE"
         self.targets = []
-        if layer.edit_target == "MASK" or layer.type in ("FILL", "FOLDER"):
+        if layer.edit_target == "MASK" or layer.type in ("FILL", "FOLDER", "FILTER"):
             effect = layer.active_mask_effect
             if (effect is None or effect.type != "PAINT") and layer.mask_effects:
                 # Painting under generators would be hidden by them: paint on top instead.
@@ -83,8 +83,11 @@ class Stroke:
         self.cache = {}
         self.tree = stack.tree(ts)
         self.below = None
+        # Anchors make masks depend on other channels' live results: recomposite
+        # everything (in anchor order) on each update instead of caching.
+        self.anchors = bool(compositor.anchor_channels(ts))
         roots = [node[0].uid for node in self.tree]
-        if layer.uid in roots and layer.type != "FOLDER":
+        if layer.uid in roots and layer.type in ("PAINT", "FILL") and not self.anchors:
             i = roots.index(layer.uid)
             self.above = self.tree[:i]
             self.below = {ch.id: compositor.composite_nodes(compositor.base_array(ts, ch),
@@ -178,6 +181,15 @@ class Stroke:
                 t.current = pixels.rgba(np.where(a_new[..., None] > 0, rgb, o[..., :3]), a_new)
             pixels.write(t.image, t.current)
             overrides[t.image.name] = t.current
+
+        if self.anchors:
+            # Any channel can depend on the painted one through an anchor mask.
+            results = compositor.composite_all(self.ts, None, overrides)
+            for ch in enabled_channels(self.ts):
+                compositor.write_output(self.ts, ch, results[ch.id])
+            if self.ts.view_mode == "MASK":
+                compositor.write_mask_view(self.mat)
+            return
 
         # Drop the active layer's cached entries and mask: its images just changed.
         uid = self.layer.uid

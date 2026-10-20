@@ -18,6 +18,7 @@ REQUIRES = {
     "POSITION": ("POSITION",),
     "NOISE": (),
     "ID_MASK": ("ID",),
+    "GRUNGE": (),
 }
 
 _CACHE_SIZE = 32
@@ -135,6 +136,10 @@ def smoothstep(e0, e1, x):
 
 def _source(effect, ts):
     t = effect.type
+    if t == "GRUNGE":
+        from . import fills, grunge
+        tex = grunge.grunge_array(effect.grunge, effect.seed)[..., None]
+        return fills.project(ts, tex, effect.grunge_tiling, True)[..., 0]
     if t == "POSITION":
         return baked(ts, "POSITION")[..., "XYZ".index(effect.axis)]
     curv = baked(ts, "CURVATURE")
@@ -189,13 +194,14 @@ def evaluate(effect, ts):
 
     key = ("gen", ts.id_data.name, ts.res, _generation, effect.type, effect.level,
            effect.softness, effect.noise_amount, effect.noise_scale, effect.noise_octaves,
-           effect.seed, effect.axis)
+           effect.seed, effect.axis, effect.grunge, effect.grunge_tiling)
 
     def compute():
         if effect.type == "NOISE":
             v = _noise(effect, ts)
         else:
-            src_key = ("src", ts.id_data.name, ts.res, _generation, effect.type, effect.axis)
+            src_key = ("src", ts.id_data.name, ts.res, _generation, effect.type, effect.axis,
+                       effect.grunge, effect.grunge_tiling, effect.seed if effect.type == "GRUNGE" else 0)
             v = _cached(src_key, lambda: _source(effect, ts))
             if effect.noise_amount > 0.0:
                 v = v + (_noise(effect, ts) - 0.5) * effect.noise_amount

@@ -46,8 +46,7 @@ def gray(maps, cid):
 
 def build_maps(ts, preset, strength):
     """{suffix: (rgb_or_rgba array, srgb)} for one preset."""
-    cache = {}
-    maps = {c.id: compositor.composite_channel(ts, c, cache=cache) for c in enabled_channels(ts)}
+    maps = compositor.composite_all(ts)
     res = ts.res
     one = np.ones((res, res), np.float32)
     zero = np.zeros((res, res), np.float32)

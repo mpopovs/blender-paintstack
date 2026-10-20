@@ -6,8 +6,15 @@
 | 1. MVP | ✅ v0.1 | Texture sets, paint and fill layers, blend modes, masks, multi-channel strokes, undo, export presets |
 | 2. Masks and baking | ✅ v0.2.1 | Mesh-map baker (normal high→low, AO, curvature, thickness, position, world normal, ID; cage object; non-blocking); generators (edge wear, dirt, curvature, AO, thickness, position gradient, 3D noise on the GPU); Color Selection from the ID map; a mask stack with paint, fill, levels and blur |
 | 3. Painter UX | ✅ v0.3 | Brush tips (built-in and image) with rotation and jitter, a screen-space stencil, a brush preset library, layer folders, a channel and mask isolation view, a Normal channel with whiteout blending, fill textures (UV and tri-planar), lazy mouse, line strokes |
-| 4. Smart assets | next | Smart materials and smart masks (save or load a layer stack as an asset), Asset Browser integration, a CC0 grunge library, filters (blur, HSL, warp, sharpen), anchor points |
-| 5. Performance | | GPU compositor (keep layers as GPU textures, composite in GLSL), dirty-rectangle updates, tiled 4K/8K and UDIM, an optional C++ extension |
+| 4. Smart assets | ✅ v0.4 | Built-in and saved smart materials and smart masks (as `.blend` assets in an Asset Browser library), a procedural seamless grunge library, filter layers (blur, sharpen, HSL, warp), anchor points |
+| 5. Performance | next | GPU compositor (keep layers as GPU textures, composite in GLSL), dirty-rectangle updates, tiled 4K/8K and UDIM, an optional C++ extension |
+
+## Known limitations (v0.4)
+
+- Smart assets are applied from the PaintStack panel. Dragging a saved asset from the Asset Browser onto an object assigns it as a separate material and texture set; it does not merge into the current stack.
+- Saved asset files have no thumbnail. Blender renders material previews only in an interactive session.
+- With anchors in the stack, each stroke update recomposites every channel. This is correct, but slower on large stacks.
+- Filter layers run on the CPU. Blur and Warp at 4K take noticeable time per change.
 
 ## Known limitations (v0.3)
 

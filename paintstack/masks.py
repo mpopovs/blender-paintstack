@@ -52,7 +52,17 @@ def blend(base, v, alpha, mode):
     return np.clip(base + (out - base) * alpha, 0.0, 1.0)
 
 
-def effect_value(effect, ts, overrides=None):
+def anchor_value(effect, cache):
+    """The anchor's channel result (luminance) remapped by Level / Softness."""
+    arr = cache.get(("anchor", effect.anchor_uid, effect.anchor_channel)) if cache else None
+    if arr is None:
+        return None
+    v = arr[..., 0] * 0.2126 + arr[..., 1] * 0.7152 + arr[..., 2] * 0.0722
+    t = 1.0 - effect.level
+    return generators.smoothstep(t - effect.softness, t + effect.softness, v).astype(np.float32)
+
+
+def effect_value(effect, ts, overrides=None, cache=None):
     """(value, alpha) for a non-filter effect, or None if it has nothing to add."""
     if effect.type == "PAINT":
         if effect.image is None:
@@ -61,13 +71,16 @@ def effect_value(effect, ts, overrides=None):
         return px[..., 0], px[..., 3] * effect.opacity
     if effect.type == "FILL":
         return np.float32(effect.value), effect.opacity
+    if effect.type == "ANCHOR":
+        v = anchor_value(effect, cache)
+        return None if v is None else (v, effect.opacity)
     v = generators.evaluate(effect, ts)
     if v is None:
         return None
     return v, effect.opacity
 
 
-def evaluate(layer, overrides=None):
+def evaluate(layer, overrides=None, cache=None):
     """The layer's final mask as (res, res) float, or None when it has no active mask."""
     if not (layer.has_mask and layer.mask_enabled):
         return None
@@ -87,7 +100,7 @@ def evaluate(layer, overrides=None):
                 f = 1.0 - f
             m = blend(m, f, e.opacity, "NORMAL")
             continue
-        ev = effect_value(e, ts, overrides)
+        ev = effect_value(e, ts, overrides, cache)
         if ev is None:
             continue
         v, alpha = ev

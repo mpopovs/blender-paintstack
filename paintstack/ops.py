@@ -6,6 +6,7 @@ from bpy.types import Operator
 
 from . import brushes, compositor, material, pixels, stack, undo
 from .channels import CHANNELS
+from .grunge import GRUNGE_TYPES
 from .props import EFFECT_TYPES
 
 
@@ -55,6 +56,8 @@ EFFECT_DEFAULTS = {
     "THICKNESS": dict(level=0.5, softness=0.3, noise_amount=0.0),
     "POSITION": dict(level=0.5, softness=0.3, noise_amount=0.1),
     "NOISE": dict(level=0.5, softness=0.2, noise_scale=6.0),
+    "GRUNGE": dict(level=0.5, softness=0.2, noise_amount=0.0),
+    "ANCHOR": dict(level=0.5, softness=0.1),
 }
 
 
@@ -161,7 +164,8 @@ class PAINTSTACK_OT_layer_add(Operator):
     bl_label = "Add Layer"
     bl_options = {"REGISTER", "UNDO"}
 
-    type: EnumProperty(items=[("PAINT", "Paint", ""), ("FILL", "Fill", ""), ("FOLDER", "Folder", "")])
+    type: EnumProperty(items=[("PAINT", "Paint", ""), ("FILL", "Fill", ""), ("FOLDER", "Folder", ""),
+                              ("FILTER", "Filter", "")])
 
     @classmethod
     def poll(cls, context):
@@ -169,7 +173,7 @@ class PAINTSTACK_OT_layer_add(Operator):
 
     def execute(self, context):
         mat, _ = texture_set(context)
-        new_layer(mat, self.type, "Folder" if self.type == "FOLDER" else None)
+        new_layer(mat, self.type, {"FOLDER": "Folder", "FILTER": "Filter"}.get(self.type))
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -242,18 +246,16 @@ class PAINTSTACK_OT_layer_duplicate(Operator):
             for key in ("enabled", "blend_mode", "opacity", "color", "value", "texture"):
                 setattr(dlc, key, getattr(slc, key))
             if slc.image:
-                dlc.image = slc.image.copy()
-                dlc.image.name = _image_name(mat, dst, dlc.channel.lower())
+                dlc.image = pixels.clone_image(slc.image, pixels.PREFIX + _image_name(mat, dst, dlc.channel.lower()))
         if src.mask_image:
-            dst.mask_image = src.mask_image.copy()
-            dst.mask_image.name = _image_name(mat, dst, "mask")
+            dst.mask_image = pixels.clone_image(src.mask_image, pixels.PREFIX + _image_name(mat, dst, "mask"))
         for se in src.mask_effects:
             de = dst.mask_effects.add()
             for prop in se.bl_rna.properties:
                 if prop.identifier not in ("rna_type", "image") and not prop.is_readonly:
                     setattr(de, prop.identifier, getattr(se, prop.identifier))
             if se.image:
-                de.image = se.image.copy()
+                de.image = pixels.clone_image(se.image)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -424,6 +426,134 @@ class PAINTSTACK_OT_brush_preset_delete(Operator):
         return {"FINISHED"}
 
 
+class PAINTSTACK_OT_smart_apply(Operator):
+    """Apply a smart material (as a folder above the active layer) or a smart mask
+    (onto the active layer's mask stack)"""
+    bl_idname = "paintstack.smart_apply"
+    bl_label = "Apply Smart Asset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    kind: EnumProperty(items=[("SMART_MATERIAL", "Smart Material", ""), ("SMART_MASK", "Smart Mask", "")])
+    name: StringProperty()
+    path: StringProperty(description="Library .blend; empty for a built-in")
+
+    @classmethod
+    def poll(cls, context):
+        return texture_set(context)[0] is not None
+
+    def execute(self, context):
+        from . import smart
+        mat, ts = texture_set(context)
+        if self.kind == "SMART_MASK" and ts.active_layer is None:
+            self.report({"ERROR"}, "Select a layer to receive the smart mask")
+            return {"CANCELLED"}
+        try:
+            if self.path:
+                smart.apply_asset(mat, bpy.path.abspath(self.path))
+            elif self.kind == "SMART_MATERIAL":
+                smart.apply_spec(mat, self.name, smart.SMART_MATERIALS[self.name])
+            else:
+                smart.apply_mask_spec(mat, ts.active_layer, smart.SMART_MASKS[self.name])
+                ts.active_layer.edit_target = "MASK"
+        except (KeyError, RuntimeError, OSError) as e:
+            self.report({"ERROR"}, f"Could not apply '{self.name}': {e}")
+            return {"CANCELLED"}
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_smart_save(Operator):
+    """Save the active layer (or folder) as a smart material, or its mask stack as a
+    smart mask, into the PaintStack asset library"""
+    bl_idname = "paintstack.smart_save"
+    bl_label = "Save Smart Asset"
+
+    kind: EnumProperty(items=[("SMART_MATERIAL", "Smart Material", ""), ("SMART_MASK", "Smart Mask", "")])
+    name: StringProperty(name="Name", default="My Smart Material")
+    description: StringProperty(name="Description")
+
+    @classmethod
+    def poll(cls, context):
+        mat, ts = texture_set(context)
+        return mat is not None and ts.active_layer is not None
+
+    def invoke(self, context, event):
+        layer = texture_set(context)[1].active_layer
+        self.name = layer.name if self.kind == "SMART_MATERIAL" else layer.name + " Mask"
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        from . import smart
+        mat, ts = texture_set(context)
+        if self.kind == "SMART_MASK" and not ts.active_layer.has_mask:
+            self.report({"ERROR"}, "The active layer has no mask to save")
+            return {"CANCELLED"}
+        path = smart.save_asset(mat, self.name, self.kind, description=self.description)
+        self.report({"INFO"}, f"Saved {path}")
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_smart_delete(Operator):
+    """Delete a saved smart asset from the library"""
+    bl_idname = "paintstack.smart_delete"
+    bl_label = "Delete Smart Asset"
+
+    path: StringProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        import os
+        if os.path.isfile(self.path) and self.path.endswith(".blend"):
+            os.remove(self.path)
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+class PAINTSTACK_OT_grunge_image(Operator):
+    """Create a tileable grunge texture from the built-in library (as a stencil, a
+    brush tip, or just an image to pick in any texture field)"""
+    bl_idname = "paintstack.grunge_image"
+    bl_label = "Grunge Texture"
+
+    kind: EnumProperty(name="Texture", items=GRUNGE_TYPES)
+    seed: IntProperty(name="Seed", min=0, default=0)
+    use_as: EnumProperty(items=[("IMAGE", "Image", "Only create the image"),
+                                ("STENCIL", "Stencil", "Use as the brush stencil"),
+                                ("TIP", "Brush Tip", "Use as the brush tip")])
+
+    def execute(self, context):
+        from . import grunge
+        img = grunge.make_image(self.kind, self.seed)
+        b = context.scene.paintstack_brush
+        if self.use_as == "STENCIL":
+            b.stencil_image, b.use_stencil = img, True
+        elif self.use_as == "TIP":
+            b.tip_image, b.tip = img, "IMAGE"
+        self.report({"INFO"}, f"Image '{img.name}' ready")
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_effect_set_anchor(Operator):
+    """Choose the anchor layer this Anchor effect reads"""
+    bl_idname = "paintstack.effect_set_anchor"
+    bl_label = "Set Anchor"
+    bl_options = {"REGISTER", "UNDO"}
+
+    uid: StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        layer = _active_layer(context)[1]
+        return layer is not None and layer.active_mask_effect is not None
+
+    def execute(self, context):
+        layer = _active_layer(context)[1]
+        layer.active_mask_effect.anchor_uid = self.uid
+        return {"FINISHED"}
+
+
 def _active_layer(context):
     mat, ts = texture_set(context)
     return (mat, ts.active_layer) if mat is not None else (None, None)
@@ -538,6 +668,11 @@ classes = (
     PAINTSTACK_OT_brush_preset_apply,
     PAINTSTACK_OT_brush_preset_save,
     PAINTSTACK_OT_brush_preset_delete,
+    PAINTSTACK_OT_smart_apply,
+    PAINTSTACK_OT_smart_save,
+    PAINTSTACK_OT_smart_delete,
+    PAINTSTACK_OT_grunge_image,
+    PAINTSTACK_OT_effect_set_anchor,
     PAINTSTACK_OT_effect_add,
     PAINTSTACK_OT_effect_remove,
     PAINTSTACK_OT_effect_move,

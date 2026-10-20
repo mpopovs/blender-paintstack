@@ -29,26 +29,29 @@ def _uv_grid(res):
     return np.meshgrid(g, g)
 
 
+def can_triplanar(ts):
+    return ts.baked_map("POSITION") is not None and ts.baked_map("WORLD_NORMAL") is not None
+
+
+def project(ts, tex, tiling, triplanar):
+    """Map a tileable (h, w, c) texture onto the texture set: UV tiling, or
+    tri-planar from the baked Position / World Normal maps."""
+    res = ts.res
+    if not (triplanar and can_triplanar(ts)):
+        u, v = _uv_grid(res)
+        return bilinear_wrap(tex, u * tiling, v * tiling)
+    pos = generators.baked(ts, "POSITION") * tiling
+    n = generators.baked(ts, "WORLD_NORMAL") * 2.0 - 1.0
+    w = np.abs(n) ** 4
+    w /= np.maximum(w.sum(-1, keepdims=True), 1e-6)
+    x_proj = bilinear_wrap(tex, pos[..., 1], pos[..., 2])
+    y_proj = bilinear_wrap(tex, pos[..., 0], pos[..., 2])
+    z_proj = bilinear_wrap(tex, pos[..., 0], pos[..., 1])
+    return x_proj * w[..., :1] + y_proj * w[..., 1:2] + z_proj * w[..., 2:]
+
+
 def sample(ts, layer, image, allow_triplanar=True):
     """(res, res, 3) texture for a fill layer channel, cached until inputs change."""
-    res = ts.res
-    triplanar = (allow_triplanar and layer.projection == "TRIPLANAR"
-                 and ts.baked_map("POSITION") is not None and ts.baked_map("WORLD_NORMAL") is not None)
-    key = ("fill", image.name, tuple(image.size), res, layer.tiling, triplanar, generators._generation)
-
-    def compute():
-        tex = pixels.read(image)[..., :3]
-        t = layer.tiling
-        if not triplanar:
-            u, v = _uv_grid(res)
-            return bilinear_wrap(tex, u * t, v * t)
-        pos = generators.baked(ts, "POSITION") * t
-        n = generators.baked(ts, "WORLD_NORMAL") * 2.0 - 1.0
-        w = np.abs(n) ** 4
-        w /= np.maximum(w.sum(-1, keepdims=True), 1e-6)
-        x_proj = bilinear_wrap(tex, pos[..., 1], pos[..., 2])
-        y_proj = bilinear_wrap(tex, pos[..., 0], pos[..., 2])
-        z_proj = bilinear_wrap(tex, pos[..., 0], pos[..., 1])
-        return x_proj * w[..., :1] + y_proj * w[..., 1:2] + z_proj * w[..., 2:]
-
-    return generators._cached(key, compute)
+    triplanar = allow_triplanar and layer.projection == "TRIPLANAR" and can_triplanar(ts)
+    key = ("fill", image.name, tuple(image.size), ts.res, layer.tiling, triplanar, generators._generation)
+    return generators._cached(key, lambda: project(ts, pixels.read(image)[..., :3], layer.tiling, triplanar))

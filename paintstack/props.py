@@ -8,6 +8,7 @@ from bpy.types import PropertyGroup
 
 from .brushes import TIPS as TIP_ITEMS
 from .channels import CHANNEL_ITEMS
+from .grunge import GRUNGE_TYPES
 
 BLEND_MODES = [
     ("NORMAL", "Normal", ""),
@@ -46,6 +47,8 @@ EFFECT_TYPES = [
     ("POSITION", "Position Gradient", "Gradient along an object axis (needs Position)"),
     ("NOISE", "3D Noise", "Seamless noise sampled at the baked positions"),
     ("ID_MASK", "Color Selection", "Select areas by their baked ID colour (needs ID)"),
+    ("GRUNGE", "Grunge", "Tileable grunge texture from the built-in library"),
+    ("ANCHOR", "Anchor", "Use another layer's result (an anchor point) as the mask"),
     ("LEVELS", "Levels", "Remap the mask below"),
     ("BLUR", "Blur", "Blur the mask below"),
 ]
@@ -114,6 +117,12 @@ class PS_MaskEffect(PropertyGroup):
     id_color: FloatVectorProperty(name="ID Color", subtype="COLOR", size=3, min=0.0, max=1.0,
                                   default=(1.0, 1.0, 1.0), update=_recomposite)
     id_tolerance: FloatProperty(name="Tolerance", min=0.001, max=1.0, default=0.1, update=_recomposite)
+    grunge: EnumProperty(name="Texture", items=GRUNGE_TYPES, update=_recomposite)
+    grunge_tiling: FloatProperty(name="Tiling", min=0.05, max=50.0, default=2.0, update=_recomposite)
+    anchor_uid: StringProperty(name="Anchor", update=_recomposite,
+                               description="uid of the anchor layer this effect reads")
+    anchor_channel: EnumProperty(name="Channel", items=CHANNEL_ITEMS, default="HEIGHT",
+                                 update=_recomposite)
     # PAINT effects: RGBA, value in R, coverage in A
     image: PointerProperty(type=bpy.types.Image)
 
@@ -123,7 +132,23 @@ class PS_Layer(PropertyGroup):
     uid: StringProperty()
     type: EnumProperty(items=[("PAINT", "Paint", "", "BRUSH_DATA", 0),
                               ("FILL", "Fill", "", "IMAGE_RGB", 1),
-                              ("FOLDER", "Folder", "", "FILE_FOLDER", 2)])
+                              ("FOLDER", "Folder", "", "FILE_FOLDER", 2),
+                              ("FILTER", "Filter", "", "FILTER", 3)])
+    is_anchor: BoolProperty(name="Anchor Point", default=False, update=_recomposite,
+                            description="Make this point of the stack available to Anchor mask effects")
+    filter_type: EnumProperty(
+        name="Filter",
+        items=[("BLUR", "Blur", "Blur everything below"),
+               ("SHARPEN", "Sharpen", "Unsharp mask"),
+               ("HSL", "Hue / Saturation / Lightness", "Colour adjustment (lightness only on grey channels)"),
+               ("WARP", "Warp", "Displace by noise")],
+        update=_recomposite)
+    filter_radius: IntProperty(name="Radius", min=1, max=64, default=4, subtype="PIXEL", update=_recomposite)
+    filter_amount: FloatProperty(name="Amount", min=0.0, max=5.0, default=1.0, update=_recomposite)
+    hue: FloatProperty(name="Hue", min=-0.5, max=0.5, default=0.0, update=_recomposite)
+    saturation: FloatProperty(name="Saturation", min=-1.0, max=1.0, default=0.0, update=_recomposite)
+    lightness: FloatProperty(name="Lightness", min=-1.0, max=1.0, default=0.0, update=_recomposite)
+    warp_scale: FloatProperty(name="Warp Scale", min=0.1, max=100.0, default=8.0, update=_recomposite)
     parent_uid: StringProperty(description="uid of the folder containing this layer ('' = root)")
     expanded: BoolProperty(default=True)
     visible: BoolProperty(default=True, update=_recomposite)

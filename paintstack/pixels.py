@@ -26,6 +26,16 @@ def new_image(name, res, color, *, float_buffer=False, srgb=False, alpha=1.0):
     return img
 
 
+def clone_image(img, name=None):
+    """Pixel-exact copy. Image.copy() regenerates unsaved generated images from their
+    settings (losing painted pixels), so copy the buffer explicitly."""
+    w, h = img.size
+    new = bpy.data.images.new(name or img.name, w, h, alpha=True, float_buffer=img.is_float)
+    new.colorspace_settings.name = img.colorspace_settings.name
+    write(new, read(img))
+    return new
+
+
 def rgba(rgb, alpha):
     """Stack an (h, w, 3) array and an (h, w) alpha into RGBA."""
     return np.concatenate([rgb, alpha[..., None]], axis=-1)

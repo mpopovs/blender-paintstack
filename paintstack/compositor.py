@@ -6,7 +6,7 @@ import bpy
 import numpy as np
 
 from . import masks, pixels
-from .channels import enabled_channels
+from .channels import BY_ID as BY_ID_, enabled_channels
 
 
 def decode_normal(n):
@@ -78,7 +78,7 @@ def layer_mask(layer, overrides=None, cache=None):
         return masks.evaluate(layer, overrides)
     key = ("mask", layer.uid)
     if key not in cache:
-        cache[key] = masks.evaluate(layer, overrides)
+        cache[key] = masks.evaluate(layer, overrides, cache)
     return cache[key]
 
 
@@ -95,7 +95,7 @@ def layer_entry(layer, ch, overrides=None, cache=None):
 
 
 def _layer_entry(layer, ch, overrides, cache):
-    if not layer.visible or layer.type == "FOLDER":
+    if not layer.visible or layer.type in ("FOLDER", "FILTER"):
         return None
     lc = layer.channel(ch.id)
     if lc is None or not lc.enabled:
@@ -136,21 +136,29 @@ def composite_entries(base, entries):
 def composite_nodes(base, nodes, ch, overrides=None, cache=None):
     """Composite a top-first list of (layer, children) nodes onto base.
     Folders are pass-through: their children composite onto what is below, and the
-    folder's opacity and mask fade that result in."""
+    folder's opacity and mask fade that result in. Filter layers process what is
+    below them. Anchor layers record the result at their position in `cache`."""
     for layer, children in reversed(nodes):
-        if layer.type == "FOLDER":
-            if not layer.visible:
-                continue
-            inner = composite_nodes(base, children, ch, overrides, cache)
-            alpha = layer.opacity
-            mask = layer_mask(layer, overrides, cache)
-            if mask is not None:
-                alpha = (mask * alpha)[..., None]
-            base = base + (inner - base) * alpha
+        if layer.type in ("FOLDER", "FILTER"):
+            lc = layer.channel(ch.id)
+            if layer.visible and (layer.type == "FOLDER" or (lc is not None and lc.enabled)):
+                if layer.type == "FOLDER":
+                    inner = composite_nodes(base, children, ch, overrides, cache)
+                    alpha = layer.opacity
+                else:
+                    from . import filters
+                    inner = filters.apply(base, layer, ch)
+                    alpha = layer.opacity * lc.opacity
+                mask = layer_mask(layer, overrides, cache)
+                if mask is not None:
+                    alpha = (mask * alpha)[..., None]
+                base = base + (inner - base) * alpha
         else:
             entry = layer_entry(layer, ch, overrides, cache)
             if entry:
                 base = mix(base, entry)
+        if layer.is_anchor and cache is not None:
+            cache[("anchor", layer.uid, ch.id)] = base.copy()
     return base
 
 
@@ -181,6 +189,34 @@ def write_mask_view(mat, cache=None):
     pixels.write(img, pixels.rgba(np.repeat(m[..., None], 3, -1), np.ones_like(m)))
 
 
+def anchor_channels(ts):
+    """Channels read by Anchor mask effects (they must be composited first)."""
+    from .channels import BY_ID
+    anchors = {l.uid for l in ts.layers if l.is_anchor}
+    out = []
+    for l in ts.layers:
+        for e in l.mask_effects:
+            if e.type == "ANCHOR" and e.enabled and e.anchor_uid in anchors:
+                ch = BY_ID[e.anchor_channel]
+                if ch not in out:
+                    out.append(ch)
+    return out
+
+
+def composite_all(ts, channels=None, overrides=None, cache=None):
+    """{channel_id: rgb} for the given channels (default: enabled ones), compositing
+    anchor-referenced channels first so their anchors exist when masks need them."""
+    cache = {} if cache is None else cache
+    wanted = list(channels or enabled_channels(ts))
+    first = anchor_channels(ts)
+    results = {}
+    for ch in first + [c for c in wanted if c not in first]:
+        out = composite_channel(ts, ch, overrides, cache)
+        if ch in wanted:
+            results[ch.id] = out
+    return results
+
+
 def composite(mat, channels=None):
     from . import material
     ts = mat.paintstack
@@ -188,8 +224,8 @@ def composite(mat, channels=None):
         return
     material.ensure_outputs(mat)
     cache = {}
-    for ch in channels or enabled_channels(ts):
-        write_output(ts, ch, composite_channel(ts, ch, cache=cache))
+    for cid, rgb in composite_all(ts, channels, cache=cache).items():
+        write_output(ts, BY_ID_[cid], rgb)
     if ts.view_mode == "MASK":
         write_mask_view(mat, cache)
     material.build(mat)
