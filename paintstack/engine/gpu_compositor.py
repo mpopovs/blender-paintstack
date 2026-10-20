@@ -278,11 +278,15 @@ class GPUCompositor:
         if t is not None:
             self.pool.setdefault((t.w, t.h), []).append(t)
 
-    def run(self, name, out, textures=(), **constants):
+    def run(self, name, out, textures=(), rect=None, **constants):
+        """Draw a full-screen pass into target `out` (or only into rect = (x, y, w, h))."""
+        return self.draw(name, out.fb, rect or (0, 0, out.w, out.h), textures, **constants) and out
+
+    def draw(self, name, fb, rect, textures=(), **constants):
         sh, batch, samplers = shader(name)
-        with out.fb.bind():
+        with fb.bind():
             gpu.state.blend_set("NONE")
-            gpu.state.viewport_set(0, 0, out.w, out.h)
+            gpu.state.viewport_set(*rect)
             sh.bind()
             for ident, value in constants.items():
                 sh.uniform_float(ident, value)
@@ -292,7 +296,7 @@ class GPUCompositor:
             # Release sampler bindings (see engine.live.release_samplers).
             for ident in samplers:
                 sh.uniform_sampler(ident, _white())
-        return out
+        return True
 
     def op(self, name, size, textures=(), **constants):
         return self.run(name, self.acquire(*size), textures, **constants)
@@ -419,6 +423,37 @@ class GPUCompositor:
         return self.copy(base)
 
     # Output for display
+
+    def to_image_region(self, t, image, block):
+        """Write an aligned block (y0, y1, x0, x1, levels from live.aligned) of a
+        target holding final values into the image's GPU texture and its first
+        mip levels; the conversion and the mips are computed on the GPU."""
+        from . import live
+        y0, y1, x0, x1, levels = block
+        tex = gpu.texture.from_image(image)
+        to_linear = float(tex.format.startswith("SRGB") and live.srgb_encodes())
+        level, owned = t, []
+        try:
+            for mip in range(levels):
+                ly0, ly1, lx0, lx1 = y0 >> mip, y1 >> mip, x0 >> mip, x1 >> mip
+                if ly1 <= ly0 or lx1 <= lx0:
+                    break
+                rect = (lx0, ly0, lx1 - lx0, ly1 - ly0)
+                if mip:
+                    nxt = self.acquire(max(1, level.w // 2), max(1, level.h // 2))
+                    owned.append(nxt)
+                    self.run("down", nxt, (level.tex,), rect=rect)
+                    level = nxt
+                try:
+                    fb = gpu.types.GPUFrameBuffer(color_slots={"texture": tex, "mip": mip})
+                except Exception:
+                    if mip == 0:
+                        raise
+                    break  # no further mip levels
+                self.draw("final", fb, rect, (level.tex,), params=(0.0, to_linear, 0.0, 0.0))
+        finally:
+            for o in owned:
+                self.release(o)
 
     def to_image(self, t, image, is_normal):
         """Write a composited result into an image's GPU texture (and its mips)."""

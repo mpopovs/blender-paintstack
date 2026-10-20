@@ -138,10 +138,24 @@ def parallel_rows(fn, rows, size):
     """Run fn(y0, y1) over row chunks, in parallel when the work is big enough.
     More chunks than threads, so slower cores do not hold the others up."""
     n = threads()
-    if n <= 1 or size < PARALLEL_MIN:
-        fn(0, rows)
+    if n <= 1 or size < PARALLEL_MIN or in_pool():
+        fn(0, rows)  # (inside a pool task: waiting on the pool could deadlock)
         return
     list(pool().map(lambda c: fn(*c), row_chunks(rows, n * 3)))
+
+
+def in_pool():
+    """True on one of PaintStack's pool threads."""
+    import threading
+    return threading.current_thread().name.startswith("paintstack")
+
+
+def parallel_map(fn, items):
+    """list(map(fn, items)) on the pool (serially when nested in a pool task)."""
+    items = list(items)
+    if len(items) < 2 or threads() <= 1 or in_pool():
+        return [fn(i) for i in items]
+    return list(pool().map(fn, items))
 
 
 def summary():

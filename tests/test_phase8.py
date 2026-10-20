@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _env import fresh_scene  # noqa: E402  (also sets up the GPU)
 
-from paintstack import compositor  # noqa: E402
-from paintstack.engine import gpu_compositor, projector as projector_mod  # noqa: E402
+from paintstack import compositor, pixels  # noqa: E402
+from paintstack.engine import gpu_compositor, live, projector as projector_mod  # noqa: E402
 from paintstack.engine.projector import Projector  # noqa: E402
 from paintstack.stroke import Stroke  # noqa: E402
 from test_headless import W, H, check, front_view  # noqa: E402
@@ -141,8 +141,21 @@ def main():
         pending = set(compositor.state(mat).gpu_results)
         check(pending == {c.id for c in compositor.enabled_channels(ts)}, "composite left GPU results pending")
         s = stroke(obj, mat, live_mode)
-        check(not s.sinks if not live_mode else set(s.sinks) == set(s.unsynced) | set(s.sinks),
+        check(bool(s.sinks) == live_mode and (live_mode or bool(s.outputs)),
               f"stroke took the pending outputs (live={live_mode}, sinks={len(s.sinks)})")
+        if live_mode and "ROUGHNESS" in s.sinks:
+            # The viewport texture mid-stroke: level 0 and a mip level built on the GPU.
+            gc = gpu_compositor.instance()
+            sink = gc.read(s.sinks["ROUGHNESS"])[..., 0]
+            img = ts.output("ROUGHNESS")
+            lvl0 = live.read_level(img, 0)[..., 0]
+            lvl2 = live.read_level(img, 2)[..., 0]
+            box = sink.reshape(sink.shape[0] // 4, 4, sink.shape[1] // 4, 4).mean((1, 3))
+            check(np.abs(sink - pixels.read(img)[..., 0]).max() > 0.05, "stroke changed the sink")
+            check(np.abs(lvl0 - sink).max() <= TOL, f"viewport level 0 == stroke result "
+                                                    f"({np.abs(lvl0 - sink).max():.4f})")
+            check(np.abs(lvl2 - box).max() <= 2 * TOL, f"viewport mip 2 == 4x4 average "
+                                                       f"({np.abs(lvl2 - box).max():.4f})")
         s.finish()
         if live_mode:
             check(set(compositor.state(mat).gpu_results) >= {c.id for c in s.channels},

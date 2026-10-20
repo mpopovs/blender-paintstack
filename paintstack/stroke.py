@@ -101,6 +101,7 @@ class Stroke:
         # way the images are written once, after the stroke.
         used = [c.id for c in (enabled_channels(ts) if self.anchors else self.channels)]
         self.sinks = compositor.take_gpu_targets(mat, used) if self.live else {}
+        self.scratch = {}  # channel -> GPU target staging CPU-held outputs for the live display
         self.outputs.update(compositor.take_gpu_outputs(mat, used))
         self.unsynced = set(self.outputs)
 
@@ -167,34 +168,68 @@ class Stroke:
     # Output
 
     def _apply_targets(self, m, region):
-        """Write the stroke mask m (covering region) into every target's current pixels."""
+        """Write the stroke mask m (covering region) into every target's current
+        pixels, in (target, row band) pieces on the performance cores."""
         y0, y1, x0, x1 = region
-        for t in self.targets:
-            o = t.orig[y0:y1, x0:x1]
-            cur = t.current[y0:y1, x0:x1]
-            if t.mode == "MASK":
-                cur[..., :3] = o[..., :3] + (t.value - o[..., :3]) * m[..., None]
-                cur[..., 3] = 1.0
-            elif t.mode == "ERASE":
-                cur[..., :3] = o[..., :3]
-                cur[..., 3] = o[..., 3] * (1.0 - m)
-            else:
-                # Colour is blended "over" the existing content so coverage and
-                # colour stay consistent (un-premultiplied RGBA).
-                a_new = o[..., 3] + m * (1.0 - o[..., 3])
-                safe = np.maximum(a_new, 1e-6)[..., None]
-                rgb = (t.value * m[..., None] + o[..., :3] * (o[..., 3] * (1.0 - m))[..., None]) / safe
-                cur[..., :3] = np.where(a_new[..., None] > 0, rgb, o[..., :3])
-                cur[..., 3] = a_new
-            if not t.image.is_float:
-                # 8-bit images store 1/255 steps: quantise now so the live outputs,
-                # the cache and the saved image all agree.
-                np.round(cur * 255.0, out=cur)
-                cur /= 255.0
+        n = hardware.threads()
+        if n <= 1 or m.size < 128 * 128:
+            for t in self.targets:
+                self._apply_one(t, m, region)
+            return
+        bands = hardware.row_chunks(y1 - y0, max(2, 2 * n // len(self.targets)))
+        work = [(t, a, b) for t in self.targets for a, b in bands]
+        list(hardware.pool().map(lambda w: self._apply_one(w[0], m[w[1]:w[2]], (y0 + w[1], y0 + w[2], x0, x1)),
+                                 work))
+
+    @staticmethod
+    def _apply_one(t, m, region):
+        # Runs on a pool thread: must not call hardware.parallel_rows (nested pool use).
+        y0, y1, x0, x1 = region
+        o = t.orig[y0:y1, x0:x1]
+        cur = t.current[y0:y1, x0:x1]
+        m3 = m[..., None]
+        if t.mode == "MASK":
+            np.subtract(t.value, o[..., :3], out=cur[..., :3])
+            cur[..., :3] *= m3
+            cur[..., :3] += o[..., :3]
+            cur[..., 3] = 1.0
+        elif t.mode == "ERASE":
+            cur[..., :3] = o[..., :3]
+            np.subtract(1.0, m, out=cur[..., 3])
+            cur[..., 3] *= o[..., 3]
+        else:
+            # Colour is blended "over" the existing content so coverage and
+            # colour stay consistent (un-premultiplied RGBA):
+            # a = a_o + m (1 - a_o), rgb = (v m + rgb_o a_o (1 - m)) / a
+            a_o = o[..., 3]
+            a_new = cur[..., 3]
+            np.subtract(1.0, a_o, out=a_new)
+            a_new *= m
+            a_new += a_o
+            w_old = np.subtract(1.0, m, dtype=np.float32)
+            w_old *= a_o
+            rgb = cur[..., :3]
+            np.multiply(o[..., :3], w_old[..., None], out=rgb)
+            rgb += t.value * m3
+            rgb /= np.maximum(a_new, 1e-6)[..., None]
+            np.copyto(rgb, o[..., :3], where=(a_new <= 0.0)[..., None])
+        if not t.image.is_float:
+            # 8-bit images store 1/255 steps: quantise now so the live outputs,
+            # the cache and the saved image all agree.
+            cur *= 255.0
+            np.rint(cur, out=cur)
+            cur /= 255.0
 
     def _gpu(self):
         from .engine import gpu_compositor
         return gpu_compositor.instance()
+
+    def _release_scratch(self):
+        if self.scratch:
+            gc = self._gpu()
+            for t in self.scratch.values():
+                gc.release(t)
+            self.scratch = {}
 
     def _drop_sinks(self):
         """Turn GPU sinks back into output arrays (live preview failed)."""
@@ -205,6 +240,7 @@ class Stroke:
             self.unsynced.add(cid)
             gc.release(t)
         self.sinks = {}
+        self._release_scratch()
 
     def _output(self, ch):
         """Full RGBA output array, kept for the stroke and pasted into per region."""
@@ -250,9 +286,11 @@ class Stroke:
                 results = compositor.composite_all(self.ts, channels, overrides, self.cache,
                                                    None if full else work)
             else:
-                results = {ch.id: compositor.composite_nodes(
-                    compositor.base_array(self.ts, ch, work), self.tree, ch, overrides, self.cache, work)
-                    for ch in channels}
+                # Channels are independent: composite them on the performance cores.
+                outs = hardware.parallel_map(lambda ch: compositor.composite_nodes(
+                    compositor.base_array(self.ts, ch, work), self.tree, ch, overrides, self.cache, work),
+                    channels)
+                results = {ch.id: out for ch, out in zip(channels, outs)}
             iy, ix = slice(y0 - wy0, y1 - wy0), slice(x0 - wx0, x1 - wx0)
             for ch in channels:
                 rgb = compositor.finalize(ch, results[ch.id][iy, ix])
@@ -265,16 +303,20 @@ class Stroke:
         if self.live:
             try:
                 from .engine import live
+                gc = self._gpu()
                 for ch in channels:
-                    for region in regions:
-                        if ch.id in self.sinks:
-                            ay0, ay1, ax0, ax1, levels = live.aligned(region, res)
-                            block = self._gpu().read_region(self.sinks[ch.id], ay0, ay1, ax0, ax1)
-                            live.push_block(self.ts.output(ch.id), block, ay0, ax0, levels)
-                        else:
-                            live.push(self.ts.output(ch.id), self._output(ch), region)
-                    if ch.id not in self.sinks:
+                    src = self.sinks.get(ch.id)
+                    if src is None:
+                        # CPU-held output: one upload per region into a scratch
+                        # target; conversion and mips then run on the GPU.
+                        src = self.scratch.get(ch.id) or self.scratch.setdefault(ch.id, gc.acquire(res, res))
                         self.live_channels.add(ch.id)
+                    for region in regions:
+                        block = live.aligned(region, res)
+                        if ch.id not in self.sinks:
+                            ay0, ay1, ax0, ax1, _ = block
+                            gc.write_region(src, ay0, ax0, self._output(ch)[ay0:ay1, ax0:ax1])
+                        gc.to_image_region(src, self.ts.output(ch.id), block)
             except Exception as e:  # unsupported backend / format: fall back for good
                 print(f"PaintStack: GPU live preview disabled ({e})")
                 self.live = False
@@ -296,6 +338,7 @@ class Stroke:
         for cid, t in self.sinks.items():
             compositor.give_gpu_target(self.mat, cid, t)
         self.sinks = {}
+        self._release_scratch()
         # Layer images are written once, at the end of the stroke; the cache keeps
         # the new pixels so the next composite does not have to read them back.
         uid = self.layer.uid
