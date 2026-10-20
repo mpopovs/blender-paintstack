@@ -18,7 +18,19 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.5)
+## Features (v0.6)
+
+### Phase 6: Apple Silicon (MacBook Pro M2) and robustness
+See **[docs/MAC.md](docs/MAC.md)** for the Mac guide.
+- **Diagnostics** (in the add-on preferences, or **PaintStack → System**): tests every GPU path PaintStack uses against a CPU reference on your machine (Metal on Mac) and reports timings
+- **Metal-safe formats**: a half-float stroke mask (blendable on every Metal GPU) and half-float tip and stencil textures (filterable everywhere). sRGB write behaviour is measured on the machine, not assumed
+- **GPU live stroke preview**: stroke regions, and their first 7 mip levels, are written straight into the GPU textures the viewport samples, so there are no whole-image uploads while painting. CPU images are written once per stroke, and it falls back automatically if anything fails
+- **Multithreaded compositing** on the performance cores (numpy releases the GIL). Threaded results are bit-identical to single-threaded ones
+- **Unified-memory aware**: Auto cache budget of 15% of RAM. Thread count and live preview are configurable in the preferences
+- **Retina**: brush sizes are in UI points. **Mac keys**: ⌘Z / ⌘⇧Z, **F** to drag-resize the brush (useful on a trackpad), and trackpad gestures pass through
+- Dab rasterization is scissored to the texture regions the dab can reach. Facing tests use the shader's normals, so region culling and painting always agree
+- **Crash fix**: deleting an image whose texture had been sampled (for example the stencil overlay) could crash Blender, because a stale texture binding was left in the GPU state. Samplers are now released after use
+
 
 ### Phase 5: performance
 Measured with `tests/bench.py` on the same 4-core VM and the same scene: a smart-material folder with generator masks, a grunge fill, a painted layer and a top fill with a Dirt mask. Times are in milliseconds.
@@ -96,7 +108,7 @@ How:
 
 ## Install
 
-Blender 4.2 or newer (tested with 5.2).
+Blender 4.2 or newer (tested with 5.2). **On a Mac, see [docs/MAC.md](docs/MAC.md).**
 
 ```bash
 ./build.sh            # creates dist/paintstack-0.1.0.zip
@@ -145,6 +157,9 @@ paintstack/
   baker.py          Cycles mesh-map baker (stepwise BakeJob, modal operator)
   picking.py        eyedropper: ray -> UV -> baked ID colour
   engine/noise_gpu.py  GLSL fBm noise for generators
+  engine/live.py    GPU live stroke preview (region + mip writes into image textures)
+  hardware.py       Metal / unified memory / performance cores / Retina, thread pool
+  diagnostics.py    on-machine GPU self-test and timings
   engine/shaders.py GLSL: depth prepass, UV-space brush dab, UV coverage
   engine/projector.py  mesh → GPU batches, stroke-mask accumulation
   stroke.py         dab spacing, mirror, applying the stroke mask to all target channels
@@ -172,6 +187,7 @@ python tests/test_phase4.py    # grunge, filters, anchors, built-in + saved smar
 python tests/demo_phase4.py docs/smart_materials.png
 python tests/demo_grunge.py docs/grunge.png
 python tests/test_phase5.py    # caches / checkpoints / regions == from-scratch composite
+python tests/test_phase6.py    # threads, live GPU preview + mips, Retina scale, Metal formats, diagnostics
 python tests/bench.py 1024 2048 4096   # timings
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render

@@ -20,10 +20,10 @@ from collections import OrderedDict
 import bpy
 import numpy as np
 
-from . import masks, pixels
+from . import hardware, masks, pixels
 from .channels import BY_ID as BY_ID_, enabled_channels
 
-DEFAULT_BUDGET_MB = 1536
+BUDGET_OVERRIDE_MB = None  # set by tests / scripts; otherwise the add-on preference
 
 
 # Normals
@@ -70,12 +70,15 @@ def blend(base, src, mode):
     return src
 
 
-def mix(base, entry):
-    """Blend entry onto base IN PLACE (base must be an owned float32 array)."""
-    src, alpha, mode = entry
+def _rows(arr, y0, y1):
+    """Rows y0:y1 of a per-texel array; constants pass through unchanged."""
+    return arr[y0:y1] if np.ndim(arr) >= 2 else arr
+
+
+def _mix_rows(base, src, alpha, mode):
     if mode == "NORMAL" and not np.ndim(alpha) and alpha >= 1.0:
         base[...] = src
-        return base
+        return
     out = blend(base, src, mode)
     d = np.subtract(out, base, dtype=np.float32)
     if np.ndim(alpha):
@@ -83,14 +86,28 @@ def mix(base, entry):
     else:
         d *= np.float32(alpha)
     base += d
+
+
+def mix(base, entry):
+    """Blend entry onto base IN PLACE (base must be an owned float32 array).
+    Large arrays are processed in row bands on the performance cores."""
+    src, alpha, mode = entry
+    hardware.parallel_rows(lambda y0, y1: _mix_rows(base[y0:y1], _rows(src, y0, y1),
+                                                    _rows(alpha, y0, y1), mode),
+                           base.shape[0], base.size)
     return base
+
+
+def _fade_rows(base, inner, alpha):
+    d = np.subtract(inner, base, dtype=np.float32)
+    d *= alpha[..., None] if np.ndim(alpha) else np.float32(alpha)
+    base += d
 
 
 def fade(base, inner, alpha):
     """base = base + (inner - base) * alpha, in place."""
-    d = np.subtract(inner, base, dtype=np.float32)
-    d *= alpha[..., None] if np.ndim(alpha) else np.float32(alpha)
-    base += d
+    hardware.parallel_rows(lambda y0, y1: _fade_rows(base[y0:y1], inner[y0:y1], _rows(alpha, y0, y1)),
+                           base.shape[0], base.size)
     return base
 
 
@@ -162,8 +179,12 @@ def invalidate_all():
 
 
 def _budget_bytes():
-    prefs = bpy.context.preferences.addons.get(__package__)
-    mb = getattr(prefs.preferences, "cache_budget_mb", DEFAULT_BUDGET_MB) if prefs else DEFAULT_BUDGET_MB
+    mb = BUDGET_OVERRIDE_MB
+    if mb is None:
+        prefs = bpy.context.preferences.addons.get(__package__)
+        mb = getattr(prefs.preferences, "cache_budget_mb", 0) if prefs else 0
+    if mb <= 0:  # Auto: scale with (unified) memory
+        mb = hardware.auto_cache_budget_mb()
     return mb * 1024 * 1024
 
 
@@ -404,7 +425,8 @@ def write_output(ts, ch, rgb):
         buf = _out_buffers[key] = np.ones((*rgb.shape[:2], 4), np.float32)
     if ch.id == "NORMAL":
         rgb = encode_normal(decode_normal(rgb))
-    np.clip(rgb, 0.0, 1.0, out=buf[..., :3])
+    hardware.parallel_rows(lambda y0, y1: np.clip(rgb[y0:y1], 0.0, 1.0, out=buf[y0:y1, :, :3]),
+                           rgb.shape[0], rgb.size)
     pixels.write(img, buf)
 
 

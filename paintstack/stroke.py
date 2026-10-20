@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from . import brushes, compositor, pixels, stack, undo
+from . import brushes, compositor, hardware, pixels, stack, undo
 from .channels import enabled_channels
 
 SEAM_GROW = 3  # texels the stroke spreads past UV island borders
@@ -24,9 +24,15 @@ class Target:
 
 
 class Stroke:
-    def __init__(self, projector, view, mat, brush, mirror=None, seed=None):
+    def __init__(self, projector, view, mat, brush, mirror=None, seed=None, px_scale=1.0, live=None):
         """view: (width, height, perspective_matrix, view_matrix, is_perspective).
-        mirror: optional callable (x, y) -> (x, y) or None for symmetry dabs."""
+        mirror: optional callable (x, y) -> (x, y) or None for symmetry dabs.
+        px_scale: physical pixels per UI pixel (2 on Retina); brush sizes are UI pixels.
+        live: write stroke regions straight into the viewport's GPU textures
+        (None = the add-on preference)."""
+        self.px_scale = px_scale
+        self.live = hardware.live_preview_enabled() if live is None else live
+        self.live_channels = set()
         self.projector = projector
         self.mat = mat
         self.ts = ts = mat.paintstack
@@ -43,7 +49,7 @@ class Stroke:
         projector.set_tip(brushes.tip_array(brush))
         if brush.use_stencil and brush.stencil_image is not None:
             projector.set_stencil(brushes.image_luminance(brush.stencil_image), brush.stencil_x,
-                                  brush.stencil_y, brush.stencil_size, brush.stencil_rotation)
+                                  brush.stencil_y, brush.stencil_size * px_scale, brush.stencil_rotation)
         projector.clear_mask()
         self.coverage = projector.coverage()
 
@@ -96,13 +102,13 @@ class Stroke:
 
     def _dab(self, x, y, pressure):
         b, rng = self.brush, self.rng
-        radius = b.radius * (1.0 + b.size_jitter * 0.9 * (rng.random() * 2.0 - 1.0))
+        radius = b.radius * self.px_scale * (1.0 + b.size_jitter * 0.9 * (rng.random() * 2.0 - 1.0))
         flow = b.flow * (pressure if b.use_pressure else 1.0) * (1.0 - b.flow_jitter * rng.random())
         angle = b.angle + b.angle_jitter * math.pi * (rng.random() * 2.0 - 1.0)
         if b.follow_stroke:
             angle += self.direction
         if b.scatter > 0.0:
-            r = b.radius * b.scatter * math.sqrt(rng.random())
+            r = b.radius * self.px_scale * b.scatter * math.sqrt(rng.random())
             a = rng.random() * 2.0 * math.pi
             x, y = x + r * math.cos(a), y + r * math.sin(a)
         dabs = [(x, y, radius, b.hardness, flow, angle)]
@@ -116,7 +122,7 @@ class Stroke:
     def add_point(self, x, y, pressure=1.0, lazy=True):
         """Feed a cursor position. With lazy mouse, the brush trails the cursor on a
         string of length lazy_radius and only moves when the string is taut."""
-        r = self.brush.lazy_radius if lazy else 0
+        r = self.brush.lazy_radius * self.px_scale if lazy else 0
         if self.pen is None or r <= 0:
             self.pen = (x, y)
         else:
@@ -132,7 +138,7 @@ class Stroke:
             self._dab(x, y, pressure)
             self.last = (x, y)
             return
-        step = max(self.brush.radius * self.brush.spacing, 1.0)
+        step = max(self.brush.radius * self.px_scale * self.brush.spacing, 1.0)
         lx, ly = self.last
         dist = math.hypot(x - lx, y - ly)
         if dist > 1e-6:
@@ -229,13 +235,28 @@ class Stroke:
             for ch in channels:
                 self._output(ch)[y0:y1, x0:x1, :3] = compositor.finalize(ch, results[ch.id][iy, ix])
 
-        for ch in channels:
-            pixels.write(self.ts.output(ch.id), self._output(ch))
+        if self.live:
+            try:
+                from .engine import live
+                for ch in channels:
+                    for region in regions:
+                        live.push(self.ts.output(ch.id), self._output(ch), region)
+                    self.live_channels.add(ch.id)
+            except Exception as e:  # unsupported backend / format: fall back for good
+                print(f"PaintStack: GPU live preview disabled ({e})")
+                self.live = False
+        if not self.live:
+            for ch in channels:
+                pixels.write(self.ts.output(ch.id), self._output(ch))
         if self.ts.view_mode == "MASK":
             compositor.write_mask_view(self.mat, self.cache, overrides)
 
     def finish(self):
         self.update()
+        # The live preview only touched GPU textures: store the outputs once.
+        for cid in self.live_channels:
+            pixels.write(self.ts.output(cid), self.outputs[cid])
+        self.live_channels.clear()
         # Layer images are written once, at the end of the stroke; the cache keeps
         # the new pixels so the next composite does not have to read them back.
         uid = self.layer.uid

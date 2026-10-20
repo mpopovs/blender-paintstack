@@ -3,23 +3,43 @@
 import bpy
 from bpy.app.handlers import persistent
 
-from . import baker, export, ops, paint_mode, picking, props, ui, undo
+from . import baker, diagnostics, export, ops, paint_mode, picking, props, ui, undo
 from .pixels import PREFIX
 
 class PaintStackPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     cache_budget_mb: bpy.props.IntProperty(
-        name="Compositor Cache (MB)", min=128, max=65536, default=1536,
-        description="Memory kept for decoded layers, entries and masks per texture set. "
-                    "More memory = faster tweaks and strokes on big stacks")
+        name="Compositor Cache (MB)", min=0, max=65536, default=0,
+        description="Memory kept for decoded layers, entries and masks per texture set "
+                    "(0 = Auto: 15% of system memory, which Apple Silicon shares with the GPU)")
+    threads: bpy.props.IntProperty(
+        name="Threads", min=0, max=64, default=0,
+        description="CPU threads for compositing (0 = Auto: the performance cores)")
+    gpu_live_preview: bpy.props.BoolProperty(
+        name="GPU Live Stroke Preview", default=True,
+        description="While painting, write stroke regions straight into the viewport's GPU "
+                    "textures (Metal / OpenGL) instead of re-uploading whole images")
 
     def draw(self, context):
-        self.layout.prop(self, "cache_budget_mb")
+        from . import hardware
+        layout = self.layout
+        info = hardware.summary()
+        box = layout.box()
+        box.label(text=f"{info['os']} · {info['gpu_backend']} · {info['gpu']}", icon="SYSTEM")
+        box.label(text=f"{info['ram_gb']} GB memory · {hardware.performance_cores()} performance cores "
+                       f"· display scale {info['pixel_size']:g}")
+        col = layout.column()
+        row = col.row()
+        row.prop(self, "cache_budget_mb")
+        row.label(text=f"Auto = {info['auto_cache_mb']} MB")
+        col.prop(self, "threads")
+        col.prop(self, "gpu_live_preview")
+        layout.operator("paintstack.diagnostics", icon="CHECKMARK")
 
 
 _classes = ((PaintStackPreferences,) + ops.classes + paint_mode.classes + picking.classes
-            + baker.classes + export.classes + ui.classes)
+            + baker.classes + export.classes + diagnostics.classes + ui.classes)
 
 
 @persistent

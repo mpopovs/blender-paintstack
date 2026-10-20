@@ -512,6 +512,21 @@ class PAINTSTACK_PT_bake(PaintStackPanel, Panel):
         layout.operator("paintstack.bake", icon="RENDER_STILL")
 
 
+class PAINTSTACK_PT_system(PaintStackPanel, Panel):
+    bl_label = "System"
+    bl_parent_id = "PAINTSTACK_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        from . import hardware
+        layout = self.layout
+        info = hardware.summary()
+        col = layout.column(align=True)
+        col.label(text=f"{info['gpu_backend']} · {info['gpu']}", icon="SYSTEM")
+        col.label(text=f"{info['ram_gb']} GB · {info['threads']} threads · scale {info['pixel_size']:g}")
+        layout.operator("paintstack.diagnostics", icon="CHECKMARK")
+
+
 class PAINTSTACK_PT_export(PaintStackPanel, Panel):
     bl_label = "Export"
     bl_parent_id = "PAINTSTACK_PT_main"
@@ -530,4 +545,4 @@ classes = (PAINTSTACK_UL_layers, PAINTSTACK_UL_mask_effects, PAINTSTACK_MT_add_e
            PAINTSTACK_MT_smart_masks, PAINTSTACK_MT_smart_delete, PAINTSTACK_MT_grunge,
            PAINTSTACK_PT_main, PAINTSTACK_PT_layers, PAINTSTACK_PT_smart,
            PAINTSTACK_PT_brush, PAINTSTACK_PT_brush_tip, PAINTSTACK_PT_brush_stencil,
-           PAINTSTACK_PT_bake, PAINTSTACK_PT_export)
+           PAINTSTACK_PT_bake, PAINTSTACK_PT_export, PAINTSTACK_PT_system)

@@ -9,13 +9,15 @@ from bpy.types import Operator
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
-from . import ops, undo
+from . import hardware, ops, undo
 from .engine.projector import Projector
 from .stroke import Stroke
 
 UPDATE_INTERVAL = 1.0 / 15.0
-STATUS = ("PaintStack: LMB paint · Shift+LMB line · [ ] radius · X paint/erase · "
-          "S+move/wheel/Ctrl+wheel stencil · C channel view · M material · Ctrl+Z undo · Esc exit")
+def status_text():
+    mod = "⌘" if hardware.is_mac() else "Ctrl+"
+    return ("PaintStack: LMB paint · Shift+LMB line · F / [ ] radius · X paint/erase · "
+            f"S+move/wheel/{mod}wheel stencil · C channel view · M material · {mod}Z undo · Esc exit")
 
 _projector = None  # reused between strokes while the mesh and view setup are unchanged
 
@@ -39,7 +41,7 @@ def _circle(x, y, r, n=48):
 
 def stencil_corners(brush, aspect):
     """Screen-space corners of the stencil quad (counter-clockwise from bottom-left)."""
-    h = brush.stencil_size
+    h = brush.stencil_size * hardware.pixel_size()
     w = h * aspect
     c, s = math.cos(brush.stencil_rotation), math.sin(brush.stencil_rotation)
     out = []
@@ -66,6 +68,10 @@ def _draw_stencil(brush):
     sh.uniform_float("color", (1.0, 1.0, 1.0, 0.3))
     batch.draw(sh)
     gpu.state.blend_set("NONE")
+    # Do not leave the stencil image's texture bound: deleting the image would
+    # leave the GPU state pointing at freed memory.
+    from .engine import live
+    live.release_samplers()
 
 
 def _draw_cursor(op):
@@ -75,19 +81,21 @@ def _draw_cursor(op):
     _draw_stencil(brush)
     if op.mouse is None:
         return
-    x, y = op.mouse
+    x, y = op.resize_center or op.mouse
+    scale = hardware.pixel_size()
+    radius = brush.radius * scale
     sh = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
     sh.bind()
     color = (1.0, 0.35, 0.35, 0.9) if brush.mode == "ERASE" else (1.0, 1.0, 1.0, 0.9)
     sh.uniform_float("color", color)
-    batch_for_shader(sh, "LINE_STRIP", {"pos": _circle(x, y, brush.radius)}).draw(sh)
+    batch_for_shader(sh, "LINE_STRIP", {"pos": _circle(x, y, radius)}).draw(sh)
     sh.uniform_float("color", (*color[:3], 0.35))
     if brush.tip == "ROUND":
-        batch_for_shader(sh, "LINE_STRIP", {"pos": _circle(x, y, brush.radius * brush.hardness)}).draw(sh)
+        batch_for_shader(sh, "LINE_STRIP", {"pos": _circle(x, y, radius * brush.hardness)}).draw(sh)
     else:
         a = brush.angle
-        tick = [(x, y), (x + brush.radius * math.cos(a), y + brush.radius * math.sin(a))]
+        tick = [(x, y), (x + radius * math.cos(a), y + radius * math.sin(a))]
         batch_for_shader(sh, "LINES", {"pos": tick}).draw(sh)
     pen = op.stroke.pen if op.stroke else None
     if pen and brush.lazy_radius > 0:
@@ -118,6 +126,8 @@ class PAINTSTACK_OT_paint_mode(Operator):
         self.mouse = None
         self.last_end = None  # end of the previous stroke, for Shift+click lines
         self.stencil_grab = False
+        self.resize_center = None  # F: drag to set the brush radius
+        self.resize_orig = 0
         if context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
         brush = context.scene.paintstack_brush
@@ -129,7 +139,7 @@ class PAINTSTACK_OT_paint_mode(Operator):
         self._draw = bpy.types.SpaceView3D.draw_handler_add(_draw_cursor, (self,), "WINDOW", "POST_PIXEL")
         wm.modal_handler_add(self)
         type(self).running = True
-        context.workspace.status_text_set(STATUS)
+        context.workspace.status_text_set(status_text())
         return {"RUNNING_MODAL"}
 
     def _finish(self, context):
@@ -186,7 +196,8 @@ class PAINTSTACK_OT_paint_mode(Operator):
                 self.rv3d.view_matrix.copy(), self.rv3d.is_perspective)
         try:
             self.stroke = Stroke(self._projector(context), view, self.mat, brush,
-                                 self._mirror_fn(context) if brush.mirror_x else None)
+                                 self._mirror_fn(context) if brush.mirror_x else None,
+                                 px_scale=hardware.pixel_size())
         except RuntimeError as e:
             self.report({"ERROR"}, str(e))
             self.stroke = None
@@ -200,12 +211,25 @@ class PAINTSTACK_OT_paint_mode(Operator):
             return True
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             sign = 1 if event.type == "WHEELUPMOUSE" else -1
-            if event.ctrl:
+            if event.ctrl or event.oskey:
                 brush.stencil_rotation += sign * math.radians(5)
             else:
                 brush.stencil_size *= 1.08 ** sign
             return True
         return False
+
+    def _resize_event(self, event, brush, x, y):
+        """F mode: the radius follows the cursor's distance from where F was pressed.
+        Click / Enter / F confirms, Esc / right click cancels."""
+        cx, cy = self.resize_center
+        if event.type == "MOUSEMOVE":
+            brush.radius = max(1, int(math.hypot(x - cx, y - cy) / hardware.pixel_size()))
+        elif event.value == "PRESS" and event.type in {"LEFTMOUSE", "RET", "NUMPAD_ENTER", "F"}:
+            self.resize_center = None
+        elif event.value == "PRESS" and event.type in {"ESC", "RIGHTMOUSE"}:
+            brush.radius = self.resize_orig
+            self.resize_center = None
+        return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
         if self.region is None or context.active_object != self.obj:
@@ -224,7 +248,10 @@ class PAINTSTACK_OT_paint_mode(Operator):
         self.mouse_prev = self.mouse
         self.mouse = (x, y) if inside else None
 
-        if event.type == "S" and not (event.ctrl or event.alt or event.shift):
+        if self.resize_center is not None:
+            return self._resize_event(event, brush, x, y)
+
+        if event.type == "S" and not (event.ctrl or event.alt or event.shift or event.oskey):
             self.stencil_grab = event.value == "PRESS" and brush.use_stencil
             return {"RUNNING_MODAL"}
         if self.stencil_grab and inside and self._stencil_event(event, brush, x, y):
@@ -263,7 +290,13 @@ class PAINTSTACK_OT_paint_mode(Operator):
             if event.type == "RIGHT_BRACKET":
                 brush.radius = int(brush.radius * 1.15) + 1
                 return {"RUNNING_MODAL"}
-            plain = not (event.ctrl or event.alt or event.shift)
+            plain = not (event.ctrl or event.alt or event.shift or event.oskey)
+            if event.type == "F" and plain:
+                # Start with the cursor on the current circle, like Blender's F.
+                r = brush.radius * hardware.pixel_size()
+                self.resize_center = (x - r, y)
+                self.resize_orig = brush.radius
+                return {"RUNNING_MODAL"}
             if event.type == "X" and plain:
                 brush.mode = "PAINT" if brush.mode == "ERASE" else "ERASE"
                 return {"RUNNING_MODAL"}
@@ -274,7 +307,7 @@ class PAINTSTACK_OT_paint_mode(Operator):
             if event.type == "M" and plain:
                 ops.cycle_view(ts, reset=True)
                 return {"RUNNING_MODAL"}
-            if event.type == "Z" and event.ctrl:
+            if event.type == "Z" and (event.ctrl or event.oskey):  # Cmd+Z on macOS
                 undo.redo() if event.shift else undo.undo()
                 return {"RUNNING_MODAL"}
         return {"PASS_THROUGH"}

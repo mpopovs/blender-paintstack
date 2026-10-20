@@ -202,11 +202,11 @@ def main():
           "partial readback == slice of full readback")
 
     # The cache respects its memory budget
-    compositor.DEFAULT_BUDGET_MB, old = 1, compositor.DEFAULT_BUDGET_MB
+    compositor.BUDGET_OVERRIDE_MB = 1
     compositor.composite(mat)
     total = sum(compositor._nbytes(v) for v in compositor.state(mat).cache.values())
     check(total <= 1024 * 1024, f"cache trimmed to its budget ({total / 1e6:.2f} MB)")
-    compositor.DEFAULT_BUDGET_MB = old
+    compositor.BUDGET_OVERRIDE_MB = None
     same(ts, "after cache eviction")
 
     print("FAILED" if check.failed else "ALL PASSED")

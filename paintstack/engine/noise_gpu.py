@@ -100,6 +100,9 @@ def fbm(pos, scale, octaves, perm, vals):
             sh.uniform_sampler("permTex", tex_perm)
             sh.uniform_sampler("valsTex", tex_vals)
             batch.draw(sh)
+            from .projector import _white
+            for name in ("posTex", "permTex", "valsTex"):
+                sh.uniform_sampler(name, _white())
         return read_texture(off.texture_color).astype(np.float32)
     finally:
         off.free()

@@ -94,7 +94,7 @@ _white_tex = None
 def _white():
     global _white_tex
     if _white_tex is None:
-        _white_tex = make_texture(np.ones((1, 1), np.float32), "R32F")
+        _white_tex = make_texture(np.ones((1, 1), np.float32), "R16F")
     return _white_tex
 
 
@@ -110,13 +110,26 @@ def read_texture(tex, channels=1):
 
 class Projector:
     def __init__(self, obj, depsgraph, material, res):
-        self.res = res
         pos, nor, uv = mesh_arrays(obj, depsgraph, material)
-        self.key = self.make_key(obj, material, res)
+        self._setup(pos, nor, uv, res, self.make_key(obj, material, res))
+
+    @classmethod
+    def from_arrays(cls, pos, nor, uv, res):
+        """Projector for raw per-corner arrays (used by diagnostics and tests)."""
+        p = cls.__new__(cls)
+        p._setup(np.ascontiguousarray(pos, np.float32), np.ascontiguousarray(nor, np.float32),
+                 np.ascontiguousarray(uv, np.float32), res, None)
+        return p
+
+    def _setup(self, pos, nor, uv, res, key):
+        self.res = res
+        self.key = key
         self.depth_batch = batch_for_shader(shaders.depth_shader(), "TRIS", {"pos": pos})
         self.uv_batch = batch_for_shader(shaders.dab_shader(), "TRIS",
                                          {"pos": pos, "uv": uv, "nor": nor})
-        self.mask = gpu.types.GPUOffScreen(res, res, format="RGBA32F")
+        # Half float: blendable on every Metal GPU (32-bit float blending is not
+        # guaranteed), and half the readback bandwidth.
+        self.mask = gpu.types.GPUOffScreen(res, res, format="RGBA16F")
         self.depth = None
         self.view = None
         self._coverage = None
@@ -125,8 +138,9 @@ class Projector:
         uvt = uv.reshape(-1, 3, 2)
         self._tri_uv_min = uvt.min(1)
         self._tri_uv_max = uvt.max(1)
-        n = np.cross(self._tri_pos[:, 1] - self._tri_pos[:, 0], self._tri_pos[:, 2] - self._tri_pos[:, 0])
-        self._tri_normal = n
+        # Facing uses the same (corner) normals as the dab shader, not the winding,
+        # so flipped winding or custom normals cannot disagree with what is painted.
+        self._tri_normal = nor.reshape(-1, 3, 3).sum(1)
         self._pending = []
 
     @staticmethod
@@ -193,13 +207,12 @@ class Projector:
         self._scr_max = np.stack([sx.max(1), sy.max(1)], 1)
         self._tri_ok = visible & facing
 
-    def take_regions(self, margin=0):
-        """Texture regions (y0, y1, x0, x1) touched by the dabs since the last call,
+    def regions_for(self, dabs, margin=0):
+        """Texture regions (y0, y1, x0, x1) that dabs [(x, y, radius), ...] can touch,
         as a few rectangles (one per cluster of touched UV area)."""
-        if not self._pending:
+        d = np.asarray(dabs, np.float32).reshape(-1, 3)
+        if not len(d):
             return []
-        d = np.array(self._pending, np.float32)
-        self._pending = []
         lo = d[:, :2] - d[:, 2:3]
         hi = d[:, :2] + d[:, 2:3]
         hit = ((self._scr_min[None] <= hi[:, None]) & (self._scr_max[None] >= lo[:, None])).all(-1).any(0)
@@ -208,7 +221,6 @@ class Projector:
             return []
         res = self.res
         cells = 64
-        cell = res / cells
         x0 = np.clip(np.floor(self._tri_uv_min[hit, 0] * cells), 0, cells - 1).astype(np.int64)
         y0 = np.clip(np.floor(self._tri_uv_min[hit, 1] * cells), 0, cells - 1).astype(np.int64)
         x1 = np.clip(np.floor(self._tri_uv_max[hit, 0] * cells), 0, cells - 1).astype(np.int64)
@@ -221,6 +233,11 @@ class Projector:
         np.add.at(diff, (y1 + 1, x1 + 1), 1)
         occ = diff.cumsum(0).cumsum(1)[:cells, :cells] > 0
         return cells_to_regions(occ, res, margin)
+
+    def take_regions(self, margin=0):
+        """Regions touched by the dabs since the last call (see regions_for)."""
+        pending, self._pending = self._pending, []
+        return self.regions_for(pending, margin)
 
     def _upload_view(self):
         v = self.view
@@ -240,7 +257,8 @@ class Projector:
 
     def set_tip(self, tip):
         """tip: (n, n) float array (brush-local, bottom row first) or None for the round falloff."""
-        self.tip = None if tip is None else make_texture(tip, "R32F")
+        # R16F: linearly filterable on every backend (R32F filtering is optional on Metal).
+        self.tip = None if tip is None else make_texture(tip, "R16F")
         self._upload_view()
 
     def set_stencil(self, image, x, y, half_height, rotation):
@@ -249,7 +267,7 @@ class Projector:
             self.stencil = None
         else:
             h, w = image.shape[:2]
-            self.stencil = {"tex": make_texture(image, "R32F"), "aspect": w / h,
+            self.stencil = {"tex": make_texture(image, "R16F"), "aspect": w / h,
                             "transform": (x, y, max(half_height, 1.0), rotation)}
         self._upload_view()
 
@@ -265,7 +283,17 @@ class Projector:
             return
         sh = shaders.dab_shader()
         white = _white()
+        boxes = self.regions_for([(d[0], d[1], d[2]) for d in dabs], margin=2) if self.view else []
+        if not boxes:
+            return  # no visible, front-facing triangle under any dab: nothing to draw
+        by0 = min(b[0] for b in boxes)
+        by1 = max(b[1] for b in boxes)
+        bx0 = min(b[2] for b in boxes)
+        bx1 = max(b[3] for b in boxes)
         with self.mask.bind():
+            # Only rasterize the part of the texture these dabs can reach.
+            gpu.state.scissor_test_set(True)
+            gpu.state.scissor_set(bx0, by0, bx1 - bx0, by1 - by0)
             gpu.state.blend_set("ALPHA")
             gpu.state.depth_test_set("NONE")
             gpu.state.face_culling_set("NONE")
@@ -282,6 +310,11 @@ class Projector:
                 sh.uniform_float("dab", (angle, flow, 0.0, 0.0))
                 self.uv_batch.draw(sh)
             gpu.state.blend_set("NONE")
+            # Leave no pointers to textures that are freed with this projector
+            # (or with a deleted stencil / tip image) in the GPU state.
+            for name in ("depthTex", "tipTex", "stencilTex"):
+                sh.uniform_sampler(name, white)
+            gpu.state.scissor_test_set(False)
 
     def read_mask(self, region=None):
         """Stroke mask (res, res), or just a region (y0, y1, x0, x1) of it."""
