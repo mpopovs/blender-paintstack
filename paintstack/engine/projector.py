@@ -55,6 +55,23 @@ def mesh_arrays(obj, depsgraph, material):
             np.ascontiguousarray(uv.reshape(-1, 2)[tris], np.float32))
 
 
+def make_texture(arr, fmt):
+    """GPU texture from a float array of shape (h, w) or (h, w, c)."""
+    h, w = arr.shape[:2]
+    data = np.ascontiguousarray(arr, np.float32).ravel()
+    return gpu.types.GPUTexture((w, h), format=fmt, data=gpu.types.Buffer("FLOAT", data.size, data))
+
+
+_white_tex = None
+
+
+def _white():
+    global _white_tex
+    if _white_tex is None:
+        _white_tex = make_texture(np.ones((1, 1), np.float32), "R32F")
+    return _white_tex
+
+
 def read_texture(tex, channels=1):
     buf = tex.read()
     try:
@@ -97,11 +114,14 @@ class Projector:
         origin = inv.translation
         forward = -(inv.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
         self.view = {
-            "viewProj": perspective_matrix,
+            "viewProj": np.array(perspective_matrix, np.float32),
             "viewO": (*origin, 1.0 if is_perspective else 0.0),
             "viewF": (*forward, depth_bias),
             "size": (width, height),
         }
+        self.tip = None
+        self.stencil = None
+        self._upload_view()
         if self.depth is None or (self.depth.width, self.depth.height) != (width, height):
             if self.depth:
                 self.depth.free()
@@ -114,15 +134,41 @@ class Projector:
             gpu.state.depth_test_set("LESS_EQUAL")
             gpu.state.depth_mask_set(True)
             sh.bind()
-            self._set_view(sh)
+            sh.uniform_block("vp", self.ubo)
             self.depth_batch.draw(sh)
             gpu.state.depth_test_set("NONE")
             gpu.state.depth_mask_set(False)
 
-    def _set_view(self, sh):
-        sh.uniform_float("viewProj", self.view["viewProj"])
-        sh.uniform_float("viewO", self.view["viewO"])
-        sh.uniform_float("viewF", self.view["viewF"])
+    def _upload_view(self):
+        v = self.view
+        w, h = v["size"]
+        st = self.stencil
+        data = np.concatenate([
+            v["viewProj"].T.ravel(),  # GLSL matrices are column-major
+            v["viewO"], v["viewF"],
+            (w, h, 1.0 if self.tip is not None else 0.0, 1.0 if st else 0.0),
+            st["transform"] if st else (0.0, 0.0, 1.0, 0.0),
+            (st["aspect"] if st else 1.0, 0.0, 0.0, 0.0),
+        ]).astype(np.float32)
+        if getattr(self, "ubo", None) is None:
+            self.ubo = gpu.types.GPUUniformBuf(data.tobytes())
+        else:
+            self.ubo.update(data.tobytes())
+
+    def set_tip(self, tip):
+        """tip: (n, n) float array (brush-local, bottom row first) or None for the round falloff."""
+        self.tip = None if tip is None else make_texture(tip, "R32F")
+        self._upload_view()
+
+    def set_stencil(self, image, x, y, half_height, rotation):
+        """image: (h, w) float array, or None to disable. Placement is in region pixels."""
+        if image is None:
+            self.stencil = None
+        else:
+            h, w = image.shape[:2]
+            self.stencil = {"tex": make_texture(image, "R32F"), "aspect": w / h,
+                            "transform": (x, y, max(half_height, 1.0), rotation)}
+        self._upload_view()
 
     # Stroke mask
 
@@ -131,21 +177,25 @@ class Projector:
             gpu.state.active_framebuffer_get().clear(color=(0.0, 0.0, 0.0, 0.0))
 
     def dabs(self, dabs):
-        """Render brush dabs [(x, y, radius, hardness, flow), ...] into the stroke mask."""
+        """Render brush dabs [(x, y, radius, hardness, flow, angle), ...] into the stroke mask."""
         if not dabs:
             return
         sh = shaders.dab_shader()
-        w, h = self.view["size"]
+        white = _white()
         with self.mask.bind():
             gpu.state.blend_set("ALPHA")
             gpu.state.depth_test_set("NONE")
             gpu.state.face_culling_set("NONE")
             sh.bind()
-            self._set_view(sh)
+            sh.uniform_block("vp", self.ubo)
             sh.uniform_sampler("depthTex", self.depth.texture_color)
-            for x, y, radius, hardness, flow in dabs:
+            sh.uniform_sampler("tipTex", self.tip or white)
+            sh.uniform_sampler("stencilTex", self.stencil["tex"] if self.stencil else white)
+            for d in dabs:
+                x, y, radius, hardness, flow = d[:5]
+                angle = d[5] if len(d) > 5 else 0.0
                 sh.uniform_float("brush", (x, y, max(radius, 0.5), hardness))
-                sh.uniform_float("region", (w, h, flow, 0.0))
+                sh.uniform_float("dab", (angle, flow, 0.0, 0.0))
                 self.uv_batch.draw(sh)
             gpu.state.blend_set("NONE")
 

@@ -6,11 +6,28 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *One stroke paints Base Color, Roughness, Metallic and Height together (gold swirl = metallic and raised, red = glossy and recessed).*
 
+![Phase 3 brushes](docs/phase3.png)
+
+*Phase 3 brushes: stripes painted through a stencil, a Scratches tip, Dirt Splatter, a Square tip that follows the stroke, and a hammered-metal normal fill projected tri-planar (no UV seams).*
+
 ![Generators](docs/generators.png)
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.2.1)
+## Features (v0.3)
+
+### Phase 3: painter UX
+- **Brush tips**: Round, Square, Splatter, Noise, Scratches, or any image. Tips can be set to an angle or follow the stroke
+- **Dynamics**: size, angle and flow jitter, plus scatter, all seeded per stroke
+- **Stencil**: a screen-space image that masks the brush. In paint mode, hold **S** and move to reposition it, scroll to scale it, and Ctrl+scroll to rotate it. It is drawn as an overlay in the viewport
+- **Lazy mouse** for smooth lines, and **Shift+click** for a straight line from the end of the last stroke
+- **Brush presets**: 7 built-in presets (Basic Hard and Soft, Square, Dirt Splatter, Cloudy, Scratches, Ink Line). Saving your own writes JSON files to Blender's config folder, so they are shared between .blend files
+- **Normal channel**: paint or fill tangent-space normals with the **Normal Map Combine** (whiteout) blend mode. The baked high-poly normal is the base of the stack, and the height channel bumps on top
+- **Fill-layer textures** on any channel, with **UV** tiling or seamless **tri-planar** projection from the baked Position and World Normal maps
+- **Layer folders**: nested and collapsible, with their own opacity and mask stack (pass-through blending). Moving a layer up or down steps into and out of folders, and there are Group and Ungroup actions
+- **Channel isolation view**: the **View** selector, or **C** in paint mode, cycles Material → each channel → Layer Mask, and **M** returns to the material
+- The World Normal bake is now in the mesh's own space (it matches Position), which fixes tri-planar projection and curvature on rotated objects
+
 
 ### Phase 2: baking and smart masks
 - **Mesh-map baker** (Cycles): Normal (high → low, cage extrusion and max ray distance), Ambient Occlusion, Curvature, Thickness, Position, World Normal, ID. Baking works from the low poly alone, or from a high-poly object onto the low poly
@@ -60,6 +77,9 @@ In Blender, go to **Edit → Preferences → Get Extensions → ⌄ → Install 
 | Key (in paint mode) | Action |
 |---|---|
 | LMB drag | Paint |
+| Shift+LMB | Straight line from the end of the last stroke |
+| S + move / wheel / Ctrl+wheel | Move / scale / rotate the stencil |
+| C / M | Cycle channel views / back to the material |
 | `[` / `]` | Brush radius |
 | `X` | Toggle paint / erase |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo stroke |
@@ -76,6 +96,9 @@ paintstack/
   channels.py       PBR channel definitions
   compositor.py     numpy layer compositor (stack → output map per channel)
   material.py       Principled BSDF wiring (touches only PS_* nodes)
+  stack.py          layer folders: contiguous blocks in the flat list, tree, moves
+  brushes.py        brush tips and the preset library
+  fills.py          fill-layer textures: UV tiling and tri-planar projection
   masks.py          mask stack evaluation (paint / fill / generators / levels / blur)
   generators.py     edge wear, dirt, curvature, AO, thickness, position, 3D noise
   baker.py          Cycles mesh-map baker (stepwise BakeJob, modal operator)
@@ -102,6 +125,8 @@ pip install bpy numpy          # bpy wheel must match your Python version
 python tests/test_headless.py  # Phase 1: compositing, projection, occlusion, undo, masks, export, save/load
 python tests/test_phase2.py    # Phase 2: high->low bake, every map, generators, mask stack, AO in export
 python tests/test_phase2_extras.py  # ID by material, ray pick + colour selection, cage, cancelled jobs, GPU noise
+python tests/test_phase3.py    # tips, rotation, stencil, jitter, lazy, lines, presets, normals, fills, folders, views
+python tests/demo_phase3.py docs/phase3.png
 python tests/demo_render.py docs/demo.png
 python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render
 ```

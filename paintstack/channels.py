@@ -23,6 +23,7 @@ CHANNELS = (
     Channel("METALLIC", "Metallic", False, (0.0, 0.0, 0.0), False, False, "Metallic"),
     Channel("ROUGHNESS", "Roughness", False, (0.5, 0.5, 0.5), False, False, "Roughness"),
     Channel("HEIGHT", "Height", False, (0.5, 0.5, 0.5), False, True, ""),
+    Channel("NORMAL", "Normal", True, (0.5, 0.5, 1.0), False, False, ""),
     Channel("EMISSION", "Emission", True, (0.0, 0.0, 0.0), True, False, "Emission Color"),
 )
 

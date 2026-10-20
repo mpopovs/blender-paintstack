@@ -74,12 +74,18 @@ def _source_network(nt, map_type, settings, mode, color):
     if map_type == "POSITION":
         return n.new("ShaderNodeTexCoord").outputs["Generated"]
     if map_type == "WORLD_NORMAL":
+        # In the mesh's own (object) space, matching the Position map, so curvature and
+        # tri-planar projection stay correct for rotated objects and move with them.
         geo = n.new("ShaderNodeNewGeometry")
+        xf = n.new("ShaderNodeVectorTransform")
+        xf.vector_type = "NORMAL"
+        xf.convert_from, xf.convert_to = "WORLD", "OBJECT"
         vm = n.new("ShaderNodeVectorMath")
         vm.operation = "MULTIPLY_ADD"
         vm.inputs[1].default_value = (0.5, 0.5, 0.5)
         vm.inputs[2].default_value = (0.5, 0.5, 0.5)
-        link(geo.outputs["Normal"], vm.inputs[0])
+        link(geo.outputs["Normal"], xf.inputs[0])
+        link(xf.outputs[0], vm.inputs[0])
         return vm.outputs["Vector"]
     if map_type == "ID":
         if mode == "MATERIAL":

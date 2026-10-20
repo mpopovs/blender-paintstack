@@ -9,6 +9,22 @@ from . import masks, pixels
 from .channels import enabled_channels
 
 
+def decode_normal(n):
+    return n * 2.0 - 1.0
+
+
+def encode_normal(v):
+    v = v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
+    return v * 0.5 + 0.5
+
+
+def whiteout(base, detail):
+    """Combine two encoded tangent-space normals (detail on top of base)."""
+    b, d = decode_normal(base), decode_normal(np.broadcast_to(detail, base.shape))
+    return encode_normal(np.stack([b[..., 0] + d[..., 0], b[..., 1] + d[..., 1],
+                                   b[..., 2] * d[..., 2]], -1))
+
+
 def blend(base, src, mode):
     if mode == "MULTIPLY":
         return base * src
@@ -28,6 +44,8 @@ def blend(base, src, mode):
         return np.maximum(base, src)
     if mode == "DIFFERENCE":
         return np.abs(base - src)
+    if mode == "NORMAL_COMBINE":
+        return whiteout(base, src)
     return np.broadcast_to(src, base.shape)
 
 
@@ -39,8 +57,14 @@ def mix(base, entry):
     return base + (out - base) * alpha
 
 
-def base_array(ch, res):
-    return np.broadcast_to(np.asarray(ch.default, np.float32), (res, res, 3)).copy()
+def base_array(ts, ch):
+    """Starting value of a channel: its default, or the baked normal for Normal."""
+    if ch.id == "NORMAL":
+        from . import generators
+        baked = generators.baked(ts, "NORMAL")
+        if baked is not None:
+            return baked.copy()
+    return np.broadcast_to(np.asarray(ch.default, np.float32), (ts.res, ts.res, 3)).copy()
 
 
 def _read(img, overrides):
@@ -49,10 +73,29 @@ def _read(img, overrides):
     return pixels.read(img)
 
 
-def layer_entry(layer, ch, overrides=None, mask_cache=None):
+def layer_mask(layer, overrides=None, cache=None):
+    if cache is None:
+        return masks.evaluate(layer, overrides)
+    key = ("mask", layer.uid)
+    if key not in cache:
+        cache[key] = masks.evaluate(layer, overrides)
+    return cache[key]
+
+
+def layer_entry(layer, ch, overrides=None, cache=None):
     """(src, alpha, blend_mode) for one layer and channel, or None if it contributes nothing.
-    mask_cache: optional dict shared across channels so each mask stack is evaluated once."""
-    if not layer.visible:
+    cache: optional dict shared across channels (and stroke updates) so masks and
+    unchanged entries are computed once."""
+    if cache is not None and ("entry", layer.uid, ch.id) in cache:
+        return cache[("entry", layer.uid, ch.id)]
+    entry = _layer_entry(layer, ch, overrides, cache)
+    if cache is not None:
+        cache[("entry", layer.uid, ch.id)] = entry
+    return entry
+
+
+def _layer_entry(layer, ch, overrides, cache):
+    if not layer.visible or layer.type == "FOLDER":
         return None
     lc = layer.channel(ch.id)
     if lc is None or not lc.enabled:
@@ -60,20 +103,23 @@ def layer_entry(layer, ch, overrides=None, mask_cache=None):
 
     alpha = layer.opacity * lc.opacity
     if layer.type == "FILL":
-        val = tuple(lc.color) if ch.is_color else (lc.value,) * 3
-        src = np.asarray(val, np.float32)
+        if lc.texture is not None:
+            from . import fills
+            src = fills.sample(layer.id_data.paintstack, layer, lc.texture,
+                               allow_triplanar=ch.id != "NORMAL")
+            if not ch.is_color:
+                src = np.repeat(src[..., :1] * 0.2126 + src[..., 1:2] * 0.7152
+                                + src[..., 2:3] * 0.0722, 3, -1)
+        else:
+            val = tuple(lc.color) if ch.is_color else (lc.value,) * 3
+            src = np.asarray(val, np.float32)
     else:
         if lc.image is None:
             return None
         px = _read(lc.image, overrides)
         src, alpha = px[..., :3], px[..., 3] * alpha
 
-    if mask_cache is None:
-        mask = masks.evaluate(layer, overrides)
-    else:
-        if layer.uid not in mask_cache:
-            mask_cache[layer.uid] = masks.evaluate(layer, overrides)
-        mask = mask_cache[layer.uid]
+    mask = layer_mask(layer, overrides, cache)
     if mask is not None:
         alpha = mask * alpha
     if not np.ndim(alpha) and alpha <= 0.0:
@@ -87,18 +133,52 @@ def composite_entries(base, entries):
     return base
 
 
-def composite_channel(ts, ch, overrides=None, mask_cache=None):
-    # Stored top-first, so composite from the end of the list upwards.
-    entries = [layer_entry(l, ch, overrides, mask_cache) for l in reversed(ts.layers)]
-    return composite_entries(base_array(ch, ts.res), [e for e in entries if e])
+def composite_nodes(base, nodes, ch, overrides=None, cache=None):
+    """Composite a top-first list of (layer, children) nodes onto base.
+    Folders are pass-through: their children composite onto what is below, and the
+    folder's opacity and mask fade that result in."""
+    for layer, children in reversed(nodes):
+        if layer.type == "FOLDER":
+            if not layer.visible:
+                continue
+            inner = composite_nodes(base, children, ch, overrides, cache)
+            alpha = layer.opacity
+            mask = layer_mask(layer, overrides, cache)
+            if mask is not None:
+                alpha = (mask * alpha)[..., None]
+            base = base + (inner - base) * alpha
+        else:
+            entry = layer_entry(layer, ch, overrides, cache)
+            if entry:
+                base = mix(base, entry)
+    return base
+
+
+def composite_channel(ts, ch, overrides=None, cache=None):
+    from . import stack
+    return composite_nodes(base_array(ts, ch), stack.tree(ts), ch, overrides, cache)
 
 
 def write_output(ts, ch, rgb):
     img = ts.output(ch.id)
     if img is None:
         return
+    if ch.id == "NORMAL":
+        rgb = encode_normal(decode_normal(rgb))
     a = np.ones(rgb.shape[:2], np.float32)
     pixels.write(img, pixels.rgba(np.clip(rgb, 0.0, 1.0), a))
+
+
+def write_mask_view(mat, cache=None):
+    """Grey image of the active layer's final mask, for the Layer Mask view."""
+    from . import material
+    ts = mat.paintstack
+    img = material.mask_view_image(mat)
+    layer = ts.active_layer
+    m = layer_mask(layer, cache=cache) if layer is not None else None
+    if m is None:
+        m = np.ones((ts.res, ts.res), np.float32)
+    pixels.write(img, pixels.rgba(np.repeat(m[..., None], 3, -1), np.ones_like(m)))
 
 
 def composite(mat, channels=None):
@@ -107,9 +187,11 @@ def composite(mat, channels=None):
     if not ts.initialized:
         return
     material.ensure_outputs(mat)
-    mask_cache = {}
+    cache = {}
     for ch in channels or enabled_channels(ts):
-        write_output(ts, ch, composite_channel(ts, ch, mask_cache=mask_cache))
+        write_output(ts, ch, composite_channel(ts, ch, cache=cache))
+    if ts.view_mode == "MASK":
+        write_mask_view(mat, cache)
     material.build(mat)
 
 

@@ -5,7 +5,7 @@ import gpu
 import numpy as np
 from gpu_extras.batch import batch_for_shader
 
-from .projector import read_texture
+from .projector import make_texture, read_texture
 
 _shader = None
 
@@ -80,20 +80,14 @@ def _get_shader():
     return _shader
 
 
-def _texture(arr, fmt):
-    h, w = arr.shape[:2]
-    data = np.ascontiguousarray(arr, np.float32).ravel()
-    return gpu.types.GPUTexture((w, h), format=fmt, data=gpu.types.Buffer("FLOAT", data.size, data))
-
-
 def fbm(pos, scale, octaves, perm, vals):
     """pos: (h, w, 3) float32. Raises if no GPU context is available."""
     h, w = pos.shape[:2]
     rgba = np.concatenate([pos, np.ones((h, w, 1), np.float32)], -1)
     sh = _get_shader()
-    tex_pos = _texture(rgba, "RGBA32F")
-    tex_perm = _texture(perm.reshape(1, -1), "R32F")
-    tex_vals = _texture(vals.reshape(1, -1), "R32F")
+    tex_pos = make_texture(rgba, "RGBA32F")
+    tex_perm = make_texture(perm.reshape(1, -1), "R32F")
+    tex_vals = make_texture(vals.reshape(1, -1), "R32F")
     off = gpu.types.GPUOffScreen(w, h, format="RGBA32F")
     try:
         batch = batch_for_shader(sh, "TRI_FAN", {"pos": ((-1, -1), (1, -1), (1, 1), (-1, 1))})

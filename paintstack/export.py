@@ -46,7 +46,8 @@ def gray(maps, cid):
 
 def build_maps(ts, preset, strength):
     """{suffix: (rgb_or_rgba array, srgb)} for one preset."""
-    maps = {c.id: compositor.composite_channel(ts, c) for c in enabled_channels(ts)}
+    cache = {}
+    maps = {c.id: compositor.composite_channel(ts, c, cache=cache) for c in enabled_channels(ts)}
     res = ts.res
     one = np.ones((res, res), np.float32)
     zero = np.zeros((res, res), np.float32)
@@ -62,7 +63,9 @@ def build_maps(ts, preset, strength):
     out = {}
     if "BASE_COLOR" in maps:
         out["BaseColor"] = (maps["BASE_COLOR"], True)
-    normal = baked_normal
+    # The Normal channel already starts from the baked normal.
+    normal = compositor.encode_normal(compositor.decode_normal(maps["NORMAL"])) if "NORMAL" in maps \
+        else baked_normal
     if height is not None:
         detail = normal_from_height(height, strength)
         normal = detail if normal is None else combine_normals(normal, detail)

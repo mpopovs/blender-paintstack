@@ -1,10 +1,10 @@
 import uuid
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
-from . import compositor, material, pixels, undo
+from . import brushes, compositor, material, pixels, stack, undo
 from .channels import CHANNELS
 from .props import EFFECT_TYPES
 
@@ -89,10 +89,24 @@ def new_layer(mat, kind, name=None, index=None):
         lc.channel = ch.id
         lc.color = ch.default
         lc.value = ch.default[0]
-    # New layers go above the active one.
-    target = ts.active_layer_index if index is None else index
+        if ch.id == "NORMAL":
+            lc.blend_mode = "NORMAL_COMBINE"
+    uid = layer.uid
+    if index is None:
+        # New layers go above the active one, in the same folder; with an expanded
+        # folder active, they go inside it at the top.
+        active = ts.active_layer
+        if active is None or active.uid == uid:
+            target, parent = 0, ""
+        elif active.type == "FOLDER" and active.expanded:
+            target, parent = ts.active_layer_index + 1, active.uid
+        else:
+            target, parent = ts.active_layer_index, active.parent_uid
+    else:
+        target, parent = index, ""
     target = max(0, min(target, len(ts.layers) - 1))
     ts.layers.move(len(ts.layers) - 1, target)
+    ts.layers[target].parent_uid = parent
     ts.active_layer_index = target
     return ts.layers[target]
 
@@ -147,7 +161,7 @@ class PAINTSTACK_OT_layer_add(Operator):
     bl_label = "Add Layer"
     bl_options = {"REGISTER", "UNDO"}
 
-    type: EnumProperty(items=[("PAINT", "Paint", ""), ("FILL", "Fill", "")])
+    type: EnumProperty(items=[("PAINT", "Paint", ""), ("FILL", "Fill", ""), ("FOLDER", "Folder", "")])
 
     @classmethod
     def poll(cls, context):
@@ -155,7 +169,7 @@ class PAINTSTACK_OT_layer_add(Operator):
 
     def execute(self, context):
         mat, _ = texture_set(context)
-        new_layer(mat, self.type)
+        new_layer(mat, self.type, "Folder" if self.type == "FOLDER" else None)
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -173,10 +187,13 @@ class PAINTSTACK_OT_layer_remove(Operator):
 
     def execute(self, context):
         mat, ts = texture_set(context)
-        for img in layer_images(ts.active_layer):
-            bpy.data.images.remove(img)
-        ts.layers.remove(ts.active_layer_index)
-        ts.active_layer_index = min(ts.active_layer_index, len(ts.layers) - 1)
+        start = ts.active_layer_index
+        end = stack.block_end(ts, start)  # a folder takes its contents with it
+        for i in reversed(range(start, end)):
+            for img in layer_images(ts.layers[i]):
+                bpy.data.images.remove(img)
+            ts.layers.remove(i)
+        ts.active_layer_index = max(0, min(start, len(ts.layers) - 1))
         undo.clear()
         compositor.composite(mat)
         return {"FINISHED"}
@@ -196,12 +213,8 @@ class PAINTSTACK_OT_layer_move(Operator):
 
     def execute(self, context):
         mat, ts = texture_set(context)
-        i = ts.active_layer_index
-        j = i - 1 if self.direction == "UP" else i + 1
-        if not 0 <= j < len(ts.layers):
+        if ts.active_layer is None or not stack.move(ts, ts.active_layer_index, self.direction):
             return {"CANCELLED"}
-        ts.layers.move(i, j)
-        ts.active_layer_index = j
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -215,17 +228,18 @@ class PAINTSTACK_OT_layer_duplicate(Operator):
     @classmethod
     def poll(cls, context):
         mat, ts = texture_set(context)
-        return mat is not None and ts.active_layer is not None
+        return mat is not None and ts.active_layer is not None and ts.active_layer.type != "FOLDER"
 
     def execute(self, context):
         mat, ts = texture_set(context)
         src = ts.active_layer
         dst = new_layer(mat, src.type, src.name + " copy")
         src = ts.layers[ts.active_layer_index + 1]  # shifted down by the insert
-        for key in ("visible", "opacity", "mask_enabled", "mask_invert", "edit_target"):
+        for key in ("visible", "opacity", "mask_enabled", "mask_invert", "edit_target",
+                    "projection", "tiling"):
             setattr(dst, key, getattr(src, key))
         for slc, dlc in zip(src.channels, dst.channels):
-            for key in ("enabled", "blend_mode", "opacity", "color", "value"):
+            for key in ("enabled", "blend_mode", "opacity", "color", "value", "texture"):
                 setattr(dlc, key, getattr(slc, key))
             if slc.image:
                 dlc.image = slc.image.copy()
@@ -284,6 +298,129 @@ class PAINTSTACK_OT_mask_remove(Operator):
         layer.edit_target = "CONTENT"
         undo.clear()
         compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_layer_group(Operator):
+    """Put the active layer into a new folder"""
+    bl_idname = "paintstack.layer_group"
+    bl_label = "Group into Folder"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        mat, ts = texture_set(context)
+        return mat is not None and ts.active_layer is not None
+
+    def execute(self, context):
+        mat, ts = texture_set(context)
+        layer = ts.active_layer
+        uid, parent, index = layer.uid, layer.parent_uid, ts.active_layer_index
+        folder = new_layer(mat, "FOLDER", "Folder", index=index)
+        folder.parent_uid = parent
+        folder_uid = folder.uid
+        next(l for l in ts.layers if l.uid == uid).parent_uid = folder_uid
+        ts.active_layer_index = next(i for i, l in enumerate(ts.layers) if l.uid == folder_uid)
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_layer_ungroup(Operator):
+    """Dissolve the active folder, keeping its contents"""
+    bl_idname = "paintstack.layer_ungroup"
+    bl_label = "Ungroup Folder"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        mat, ts = texture_set(context)
+        return mat is not None and ts.active_layer is not None and ts.active_layer.type == "FOLDER"
+
+    def execute(self, context):
+        mat, ts = texture_set(context)
+        folder = ts.active_layer
+        for l in ts.layers:
+            if l.parent_uid == folder.uid:
+                l.parent_uid = folder.parent_uid
+        for img in layer_images(folder):
+            bpy.data.images.remove(img)
+        ts.layers.remove(ts.active_layer_index)
+        ts.active_layer_index = min(ts.active_layer_index, len(ts.layers) - 1)
+        undo.clear()
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_view_cycle(Operator):
+    """Cycle the viewport through the material and each channel (C in paint mode)"""
+    bl_idname = "paintstack.view_cycle"
+    bl_label = "Cycle Channel View"
+
+    reset: BoolProperty(default=False, description="Back to the full material")
+
+    @classmethod
+    def poll(cls, context):
+        return texture_set(context)[0] is not None
+
+    def execute(self, context):
+        cycle_view(texture_set(context)[1], self.reset)
+        return {"FINISHED"}
+
+
+def cycle_view(ts, reset=False):
+    if reset:
+        ts.view_mode = "MATERIAL"
+        return
+    from .channels import enabled_channels
+    modes = ["MATERIAL"] + [c.id for c in enabled_channels(ts)] + ["MASK"]
+    cur = ts.view_mode if ts.view_mode in modes else "MATERIAL"
+    ts.view_mode = modes[(modes.index(cur) + 1) % len(modes)]
+
+
+class PAINTSTACK_OT_brush_preset_apply(Operator):
+    """Load a brush preset"""
+    bl_idname = "paintstack.brush_preset_apply"
+    bl_label = "Apply Brush Preset"
+
+    name: StringProperty()
+
+    def execute(self, context):
+        if not brushes.apply_preset(context.scene.paintstack_brush, self.name):
+            self.report({"ERROR"}, f"No brush preset '{self.name}'")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_brush_preset_save(Operator):
+    """Save the current brush (tip, dynamics, spacing...) as a preset"""
+    bl_idname = "paintstack.brush_preset_save"
+    bl_label = "Save Brush Preset"
+
+    name: StringProperty(name="Name", default="My Brush")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        name = brushes.save_preset(context.scene.paintstack_brush, self.name)
+        self.report({"INFO"}, f"Saved brush preset '{name}'")
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_brush_preset_delete(Operator):
+    """Delete the current user brush preset"""
+    bl_idname = "paintstack.brush_preset_delete"
+    bl_label = "Delete Brush Preset"
+
+    @classmethod
+    def poll(cls, context):
+        name = context.scene.paintstack_brush.preset_name
+        return bool(name) and name not in brushes.BUILTIN_PRESETS
+
+    def execute(self, context):
+        b = context.scene.paintstack_brush
+        brushes.delete_preset(b.preset_name)
+        b.preset_name = ""
         return {"FINISHED"}
 
 
@@ -395,6 +532,12 @@ classes = (
     PAINTSTACK_OT_layer_duplicate,
     PAINTSTACK_OT_mask_add,
     PAINTSTACK_OT_mask_remove,
+    PAINTSTACK_OT_layer_group,
+    PAINTSTACK_OT_layer_ungroup,
+    PAINTSTACK_OT_view_cycle,
+    PAINTSTACK_OT_brush_preset_apply,
+    PAINTSTACK_OT_brush_preset_save,
+    PAINTSTACK_OT_brush_preset_delete,
     PAINTSTACK_OT_effect_add,
     PAINTSTACK_OT_effect_remove,
     PAINTSTACK_OT_effect_move,

@@ -1,7 +1,7 @@
 import bpy
 from bpy.types import Panel, UIList
 
-from . import generators, ops
+from . import brushes, generators, ops, stack
 from .channels import enabled_channels
 from .props import BAKE_MAPS, EFFECT_TYPES
 from .paint_mode import PAINTSTACK_OT_paint_mode
@@ -13,15 +13,30 @@ class PaintStackPanel:
     bl_category = "PaintStack"
 
 
+LAYER_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "IMAGE_RGB", "FOLDER": "FILE_FOLDER"}
+
+
 class PAINTSTACK_UL_layers(UIList):
     def draw_item(self, context, layout, data, layer, icon, active_data, active_prop, index):
         row = layout.row(align=True)
-        row.label(text="", icon="BRUSH_DATA" if layer.type == "PAINT" else "IMAGE_RGB")
+        for _ in range(stack.depth(data, layer)):
+            row.label(text="", icon="BLANK1")
+        if layer.type == "FOLDER":
+            row.prop(layer, "expanded", text="", emboss=False,
+                     icon="DISCLOSURE_TRI_DOWN" if layer.expanded else "DISCLOSURE_TRI_RIGHT")
+        row.label(text="", icon=LAYER_ICONS[layer.type])
         row.prop(layer, "name", text="", emboss=False)
-        if layer.mask_image:
+        if layer.has_mask:
             row.label(text="", icon="MOD_MASK" if layer.edit_target == "MASK" else "SELECT_SET")
         row.prop(layer, "visible", text="", emboss=False,
                  icon="HIDE_OFF" if layer.visible else "HIDE_ON")
+
+    def filter_items(self, context, data, propname):
+        # Hide the contents of collapsed folders.
+        lookup = stack.by_uid(data)
+        flags = [0 if stack.hidden_by_collapse(data, l, lookup) else self.bitflag_filter_item
+                 for l in data.layers]
+        return flags, []
 
 
 EFFECT_ICONS = {"PAINT": "BRUSH_DATA", "FILL": "SNAP_FACE", "LEVELS": "FILTER", "BLUR": "FILTER",
@@ -116,10 +131,11 @@ class PAINTSTACK_PT_main(PaintStackPanel, Panel):
         layout.label(text=f"Texture Set: {mat.name}", icon="MATERIAL")
         layout.prop(ts, "resolution")
         col = layout.column(heading="Channels", align=True)
-        for ch in ("base_color", "metallic", "roughness", "height", "emission"):
+        for ch in ("base_color", "metallic", "roughness", "height", "normal", "emission"):
             col.prop(ts, "use_" + ch)
         if ts.use_height:
             layout.prop(ts, "bump_strength")
+        layout.prop(ts, "view_mode")
 
         layout.separator()
         if PAINTSTACK_OT_paint_mode.running:
@@ -148,8 +164,12 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
         col = row.column(align=True)
         col.operator("paintstack.layer_add", text="", icon="BRUSH_DATA").type = "PAINT"
         col.operator("paintstack.layer_add", text="", icon="IMAGE_RGB").type = "FILL"
+        col.operator("paintstack.layer_add", text="", icon="FILE_FOLDER").type = "FOLDER"
         col.operator("paintstack.layer_duplicate", text="", icon="DUPLICATE")
         col.operator("paintstack.layer_remove", text="", icon="REMOVE")
+        col.separator()
+        col.operator("paintstack.layer_group", text="", icon="NEWFOLDER")
+        col.operator("paintstack.layer_ungroup", text="", icon="X")
         col.separator()
         col.operator("paintstack.layer_move", text="", icon="TRIA_UP").direction = "UP"
         col.operator("paintstack.layer_move", text="", icon="TRIA_DOWN").direction = "DOWN"
@@ -187,7 +207,17 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
         if effect is not None:
             draw_effect(box, effect, ts)
 
+        if layer.type == "FOLDER":
+            layout.label(text="Folder: opacity and mask apply to its contents", icon="INFO")
+            return
         box = layout.box()
+        if layer.type == "FILL":
+            row = box.row(align=True)
+            row.prop(layer, "projection", expand=True)
+            row.prop(layer, "tiling")
+            if layer.projection == "TRIPLANAR" and not (ts.baked_map("POSITION")
+                                                        and ts.baked_map("WORLD_NORMAL")):
+                box.label(text="Bake Position + World Normal for tri-planar", icon="ERROR")
         for ch in enabled_channels(ts):
             lc = layer.channel(ch.id)
             if lc is None:
@@ -197,10 +227,31 @@ class PAINTSTACK_PT_layers(PaintStackPanel, Panel):
             sub = row.row(align=True)
             sub.active = lc.enabled
             sub.label(text=ch.label)
-            if layer.type == "FILL":
+            if layer.type == "FILL" and lc.texture is None:
                 sub.prop(lc, "color" if ch.is_color else "value", text="")
             sub.prop(lc, "blend_mode", text="")
             sub.prop(lc, "opacity", text="")
+            if layer.type == "FILL":
+                sub = box.row(align=True)
+                sub.active = lc.enabled
+                sub.template_ID(lc, "texture", open="image.open")
+
+
+class PAINTSTACK_MT_brush_presets(bpy.types.Menu):
+    bl_label = "Brush Presets"
+
+    def draw(self, context):
+        layout = self.layout
+        for name in brushes.BUILTIN_PRESETS:
+            layout.operator("paintstack.brush_preset_apply", text=name).name = name
+        user = brushes.user_presets()
+        if user:
+            layout.separator()
+            for name in user:
+                layout.operator("paintstack.brush_preset_apply", text=name, icon="USER").name = name
+        layout.separator()
+        layout.operator("paintstack.brush_preset_save", icon="ADD")
+        layout.operator("paintstack.brush_preset_delete", icon="TRASH")
 
 
 class PAINTSTACK_PT_brush(PaintStackPanel, Panel):
@@ -215,6 +266,7 @@ class PAINTSTACK_PT_brush(PaintStackPanel, Panel):
         layout = self.layout
         b = context.scene.paintstack_brush
         _, ts = ops.texture_set(context)
+        layout.menu("PAINTSTACK_MT_brush_presets", text=b.preset_name or "Brush Presets", icon="BRUSH_DATA")
         layout.row().prop(b, "mode", expand=True)
         col = layout.column(align=True)
         col.prop(b, "radius")
@@ -225,9 +277,10 @@ class PAINTSTACK_PT_brush(PaintStackPanel, Panel):
         row = layout.row()
         row.prop(b, "use_pressure")
         row.prop(b, "mirror_x")
+        layout.prop(b, "lazy_radius")
 
         layer = ts.active_layer
-        if layer and (layer.edit_target == "MASK" or layer.type == "FILL"):
+        if layer and (layer.edit_target == "MASK" or layer.type in ("FILL", "FOLDER")):
             layout.label(text="Painting the layer mask", icon="MOD_MASK")
             return
         box = layout.box()
@@ -238,6 +291,51 @@ class PAINTSTACK_PT_brush(PaintStackPanel, Panel):
             sub = row.row(align=True)
             sub.active = getattr(b, "use_" + ch.key)
             sub.prop(b, ch.key)
+
+
+class PAINTSTACK_PT_brush_tip(PaintStackPanel, Panel):
+    bl_label = "Tip & Dynamics"
+    bl_parent_id = "PAINTSTACK_PT_brush"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        b = context.scene.paintstack_brush
+        layout.prop(b, "tip")
+        if b.tip == "IMAGE":
+            layout.template_ID(b, "tip_image", open="image.open")
+        elif b.tip not in ("ROUND", "SQUARE"):
+            layout.prop(b, "tip_seed")
+        row = layout.row(align=True)
+        row.prop(b, "angle")
+        row.prop(b, "follow_stroke", toggle=True)
+        col = layout.column(align=True)
+        col.prop(b, "size_jitter")
+        col.prop(b, "angle_jitter")
+        col.prop(b, "flow_jitter")
+        col.prop(b, "scatter")
+
+
+class PAINTSTACK_PT_brush_stencil(PaintStackPanel, Panel):
+    bl_label = "Stencil"
+    bl_parent_id = "PAINTSTACK_PT_brush"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.paintstack_brush, "use_stencil", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        b = context.scene.paintstack_brush
+        layout.active = b.use_stencil
+        layout.template_ID(b, "stencil_image", open="image.open")
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(b, "stencil_x")
+        row.prop(b, "stencil_y")
+        col.prop(b, "stencil_size")
+        col.prop(b, "stencil_rotation")
+        layout.label(text="In paint mode: hold S and move / wheel / Ctrl+wheel", icon="INFO")
 
 
 class PAINTSTACK_PT_bake(PaintStackPanel, Panel):
@@ -294,5 +392,6 @@ class PAINTSTACK_PT_export(PaintStackPanel, Panel):
 
 
 classes = (PAINTSTACK_UL_layers, PAINTSTACK_UL_mask_effects, PAINTSTACK_MT_add_effect,
-           PAINTSTACK_PT_main, PAINTSTACK_PT_layers, PAINTSTACK_PT_brush, PAINTSTACK_PT_bake,
-           PAINTSTACK_PT_export)
+           PAINTSTACK_MT_brush_presets, PAINTSTACK_PT_main, PAINTSTACK_PT_layers,
+           PAINTSTACK_PT_brush, PAINTSTACK_PT_brush_tip, PAINTSTACK_PT_brush_stencil,
+           PAINTSTACK_PT_bake, PAINTSTACK_PT_export)

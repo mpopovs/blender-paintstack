@@ -6,6 +6,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProp
                        FloatVectorProperty, IntProperty, PointerProperty, StringProperty)
 from bpy.types import PropertyGroup
 
+from .brushes import TIPS as TIP_ITEMS
 from .channels import CHANNEL_ITEMS
 
 BLEND_MODES = [
@@ -19,6 +20,7 @@ BLEND_MODES = [
     ("DARKEN", "Darken", ""),
     ("LIGHTEN", "Lighten", ""),
     ("DIFFERENCE", "Difference", ""),
+    ("NORMAL_COMBINE", "Normal Map Combine", "Add the layer's normal detail on top (whiteout blend)"),
 ]
 
 RESOLUTIONS = [(str(r), str(r), "") for r in (256, 512, 1024, 2048, 4096)]
@@ -54,7 +56,8 @@ BAKE_MAPS = [
     ("CURVATURE", "Curvature", ""),
     ("THICKNESS", "Thickness", ""),
     ("POSITION", "Position", "Bounding-box normalised object position"),
-    ("WORLD_NORMAL", "World Normal", ""),
+    ("WORLD_NORMAL", "World Normal", "Surface normals in the mesh's own space (like Substance's "
+                                     "world-space normal map)"),
     ("ID", "ID", "Colour per vertex colour, material or mesh part"),
 ]
 
@@ -75,6 +78,8 @@ class PS_LayerChannel(PropertyGroup):
     color: FloatVectorProperty(subtype="COLOR_GAMMA", size=3, min=0.0, max=1.0,
                                default=(0.8, 0.8, 0.8), update=_recomposite)
     value: FloatProperty(min=0.0, max=1.0, default=0.5, subtype="FACTOR", update=_recomposite)
+    # Fill layer texture (overrides color / value when set)
+    texture: PointerProperty(type=bpy.types.Image, update=_recomposite)
     # Paint layer content (RGBA, alpha = coverage)
     image: PointerProperty(type=bpy.types.Image)
 
@@ -117,8 +122,18 @@ class PS_Layer(PropertyGroup):
     name: StringProperty(default="Layer")
     uid: StringProperty()
     type: EnumProperty(items=[("PAINT", "Paint", "", "BRUSH_DATA", 0),
-                              ("FILL", "Fill", "", "IMAGE_RGB", 1)])
+                              ("FILL", "Fill", "", "IMAGE_RGB", 1),
+                              ("FOLDER", "Folder", "", "FILE_FOLDER", 2)])
+    parent_uid: StringProperty(description="uid of the folder containing this layer ('' = root)")
+    expanded: BoolProperty(default=True)
     visible: BoolProperty(default=True, update=_recomposite)
+    projection: EnumProperty(
+        name="Projection",
+        items=[("UV", "UV", "Tile fill textures in UV space"),
+               ("TRIPLANAR", "Tri-planar", "Project fill textures from 3 axes using the baked "
+                                           "Position and World Normal maps (no UV seams)")],
+        update=_recomposite)
+    tiling: FloatProperty(name="Tiling", min=0.01, max=100.0, default=1.0, update=_recomposite)
     opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_recomposite)
     channels: CollectionProperty(type=PS_LayerChannel)
 
@@ -196,6 +211,18 @@ def _resolution_changed(self, context):
     ops.resize_texture_set(self.id_data)
 
 
+def _view_changed(self, context):
+    from . import material
+    material.build(self.id_data)
+    if self.view_mode == "MASK":
+        _recomposite(self, context)
+
+
+def _active_layer_changed(self, context):
+    if self.view_mode == "MASK":
+        _recomposite(self, context)
+
+
 def _rebuild_material(self, context):
     from . import material
     material.build(self.id_data)
@@ -208,11 +235,21 @@ class PS_TextureSet(PropertyGroup):
     use_metallic: BoolProperty(name="Metallic", default=True, update=_recomposite)
     use_roughness: BoolProperty(name="Roughness", default=True, update=_recomposite)
     use_height: BoolProperty(name="Height", default=True, update=_recomposite)
+    use_normal: BoolProperty(name="Normal", default=False, update=_recomposite)
     use_emission: BoolProperty(name="Emission", default=False, update=_recomposite)
+    view_mode: EnumProperty(
+        name="View",
+        items=[("MATERIAL", "Material", "Full PBR material"),
+               ("BASE_COLOR", "Base Color", ""), ("METALLIC", "Metallic", ""),
+               ("ROUGHNESS", "Roughness", ""), ("HEIGHT", "Height", ""),
+               ("NORMAL", "Normal", ""), ("EMISSION", "Emission", ""),
+               ("MASK", "Layer Mask", "The active layer's final mask")],
+        update=_view_changed,
+        description="Isolate one channel in the viewport")
     bump_strength: FloatProperty(name="Bump Strength", min=0.0, max=1.0, default=0.3,
                                  update=_rebuild_material)
     layers: CollectionProperty(type=PS_Layer)
-    active_layer_index: IntProperty(default=0)
+    active_layer_index: IntProperty(default=0, update=_active_layer_changed)
     outputs: CollectionProperty(type=PS_OutputMap)
     baked: CollectionProperty(type=PS_BakedMap)
     bake: PointerProperty(type=PS_BakeSettings)
@@ -257,10 +294,39 @@ class PS_Brush(PropertyGroup):
     mode: EnumProperty(items=[("PAINT", "Paint", "", "BRUSH_DATA", 0),
                               ("ERASE", "Erase", "", "X", 1)])
 
+    preset_name: StringProperty(name="Preset", default="")
+
+    # Tip
+    tip: EnumProperty(name="Tip", items=TIP_ITEMS, default="ROUND")
+    tip_image: PointerProperty(name="Tip Image", type=bpy.types.Image)
+    tip_seed: IntProperty(name="Tip Seed", min=0, default=0)
+    angle: FloatProperty(name="Angle", subtype="ANGLE", default=0.0)
+    follow_stroke: BoolProperty(name="Follow Stroke", default=False,
+                                description="Rotate the tip along the stroke direction")
+
+    # Dynamics
+    size_jitter: FloatProperty(name="Size Jitter", min=0.0, max=1.0, default=0.0, subtype="FACTOR")
+    angle_jitter: FloatProperty(name="Angle Jitter", min=0.0, max=1.0, default=0.0, subtype="FACTOR")
+    flow_jitter: FloatProperty(name="Flow Jitter", min=0.0, max=1.0, default=0.0, subtype="FACTOR")
+    scatter: FloatProperty(name="Scatter", min=0.0, max=3.0, default=0.0,
+                           description="Random offset of each dab, relative to the radius")
+    lazy_radius: IntProperty(name="Lazy Mouse", min=0, max=500, default=0, subtype="PIXEL",
+                             description="The brush trails the cursor by this distance for smooth lines")
+
+    # Stencil (screen space)
+    use_stencil: BoolProperty(name="Stencil", default=False)
+    stencil_image: PointerProperty(name="Stencil Image", type=bpy.types.Image)
+    stencil_x: FloatProperty(name="X", default=400.0, subtype="PIXEL")
+    stencil_y: FloatProperty(name="Y", default=300.0, subtype="PIXEL")
+    stencil_size: FloatProperty(name="Size", min=4.0, default=200.0, subtype="PIXEL",
+                                description="Half the stencil's height on screen")
+    stencil_rotation: FloatProperty(name="Rotation", subtype="ANGLE", default=0.0)
+
     use_base_color: BoolProperty(name="Base Color", default=True)
     use_metallic: BoolProperty(name="Metallic", default=True)
     use_roughness: BoolProperty(name="Roughness", default=True)
     use_height: BoolProperty(name="Height", default=False)
+    use_normal: BoolProperty(name="Normal", default=False)
     use_emission: BoolProperty(name="Emission", default=False)
 
     base_color: FloatVectorProperty(name="Base Color", subtype="COLOR_GAMMA", size=3,
@@ -270,6 +336,9 @@ class PS_Brush(PropertyGroup):
     height: FloatProperty(name="Height", min=0.0, max=1.0, default=0.7, subtype="FACTOR")
     emission: FloatVectorProperty(name="Emission", subtype="COLOR_GAMMA", size=3,
                                   min=0.0, max=1.0, default=(1.0, 0.5, 0.1))
+    normal: FloatVectorProperty(name="Normal", subtype="COLOR_GAMMA", size=3, min=0.0, max=1.0,
+                                default=(0.5, 0.5, 1.0),
+                                description="Tangent-space normal to paint (0.5, 0.5, 1 = flat)")
 
     def value(self, ch):
         v = getattr(self, ch.key)
