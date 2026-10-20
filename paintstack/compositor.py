@@ -5,7 +5,7 @@ small no matter how many layers there are."""
 import bpy
 import numpy as np
 
-from . import pixels
+from . import masks, pixels
 from .channels import enabled_channels
 
 
@@ -49,16 +49,9 @@ def _read(img, overrides):
     return pixels.read(img)
 
 
-def mask_array(layer, overrides=None):
-    """Layer mask as (h, w) float, or None when the layer has no active mask."""
-    if not (layer.mask_image and layer.mask_enabled):
-        return None
-    m = _read(layer.mask_image, overrides)[..., 0]
-    return 1.0 - m if layer.mask_invert else m
-
-
-def layer_entry(layer, ch, overrides=None):
-    """(src, alpha, blend_mode) for one layer and channel, or None if it contributes nothing."""
+def layer_entry(layer, ch, overrides=None, mask_cache=None):
+    """(src, alpha, blend_mode) for one layer and channel, or None if it contributes nothing.
+    mask_cache: optional dict shared across channels so each mask stack is evaluated once."""
     if not layer.visible:
         return None
     lc = layer.channel(ch.id)
@@ -75,7 +68,12 @@ def layer_entry(layer, ch, overrides=None):
         px = _read(lc.image, overrides)
         src, alpha = px[..., :3], px[..., 3] * alpha
 
-    mask = mask_array(layer, overrides)
+    if mask_cache is None:
+        mask = masks.evaluate(layer, overrides)
+    else:
+        if layer.uid not in mask_cache:
+            mask_cache[layer.uid] = masks.evaluate(layer, overrides)
+        mask = mask_cache[layer.uid]
     if mask is not None:
         alpha = mask * alpha
     if not np.ndim(alpha) and alpha <= 0.0:
@@ -89,9 +87,9 @@ def composite_entries(base, entries):
     return base
 
 
-def composite_channel(ts, ch, overrides=None):
+def composite_channel(ts, ch, overrides=None, mask_cache=None):
     # Stored top-first, so composite from the end of the list upwards.
-    entries = [layer_entry(l, ch, overrides) for l in reversed(ts.layers)]
+    entries = [layer_entry(l, ch, overrides, mask_cache) for l in reversed(ts.layers)]
     return composite_entries(base_array(ch, ts.res), [e for e in entries if e])
 
 
@@ -109,8 +107,9 @@ def composite(mat, channels=None):
     if not ts.initialized:
         return
     material.ensure_outputs(mat)
+    mask_cache = {}
     for ch in channels or enabled_channels(ts):
-        write_output(ts, ch, composite_channel(ts, ch))
+        write_output(ts, ch, composite_channel(ts, ch, mask_cache=mask_cache))
     material.build(mat)
 
 

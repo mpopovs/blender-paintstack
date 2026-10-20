@@ -53,6 +53,22 @@ def build(mat):
     bsdf = _principled(nt)
     x, y = bsdf.location.x - 600, bsdf.location.y + 300
 
+    normal_out = None
+    baked_normal = ts.baked_map("NORMAL")
+    if ts.use_baked_normal and baked_normal is not None:
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.name = tex.label = NODE_PREFIX + "Baked Normal"
+        tex.image = baked_normal
+        tex.location = (x - 300, y - 400)
+        tex.hide = True
+        nmap = nt.nodes.new("ShaderNodeNormalMap")
+        nmap.name = NODE_PREFIX + "Normal Map"
+        nmap.location = (x, y - 400)
+        nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
+        normal_out = nmap.outputs["Normal"]
+        _unlink(nt, bsdf.inputs["Normal"])
+        nt.links.new(normal_out, bsdf.inputs["Normal"])
+
     enabled = {c.id for c in enabled_channels(ts)}
     for ch in CHANNELS:
         img = ts.output(ch.id)
@@ -71,6 +87,8 @@ def build(mat):
             bump.location = (x + 300, y)
             bump.inputs["Strength"].default_value = ts.bump_strength
             nt.links.new(tex.outputs["Color"], bump.inputs["Height"])
+            if normal_out is not None:
+                nt.links.new(normal_out, bump.inputs["Normal"])
             _unlink(nt, bsdf.inputs["Normal"])
             nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
             continue

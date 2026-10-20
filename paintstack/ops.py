@@ -6,6 +6,7 @@ from bpy.types import Operator
 
 from . import compositor, material, pixels, undo
 from .channels import CHANNELS
+from .props import EFFECT_TYPES
 
 
 def active_material(context):
@@ -39,10 +40,41 @@ def add_mask(mat, layer, white=False):
     return layer.mask_image
 
 
+def ensure_effect_image(mat, layer, effect):
+    effect.image = pixels.new_image(_image_name(mat, layer, f"fx{uuid.uuid4().hex[:4]}"),
+                                    mat.paintstack.res, (0.0, 0.0, 0.0), alpha=0.0)
+    return effect.image
+
+
+# Defaults that make each generator useful straight away.
+EFFECT_DEFAULTS = {
+    "EDGE_WEAR": dict(level=0.35, softness=0.1, noise_amount=0.5, noise_scale=20.0),
+    "DIRT": dict(level=0.4, softness=0.2, noise_amount=0.4, noise_scale=8.0),
+    "CURVATURE": dict(level=0.5, softness=0.3, noise_amount=0.0),
+    "AO": dict(level=0.5, softness=0.3, noise_amount=0.0, invert=True),
+    "THICKNESS": dict(level=0.5, softness=0.3, noise_amount=0.0),
+    "POSITION": dict(level=0.5, softness=0.3, noise_amount=0.1),
+    "NOISE": dict(level=0.5, softness=0.2, noise_scale=6.0),
+}
+
+
+def add_mask_effect(mat, layer, kind):
+    e = layer.mask_effects.add()
+    e.type = kind
+    e.name = next(label for ident, label, _ in EFFECT_TYPES if ident == kind)
+    for key, val in EFFECT_DEFAULTS.get(kind, {}).items():
+        setattr(e, key, val)
+    if kind == "PAINT":
+        ensure_effect_image(mat, layer, e)
+    layer.active_mask_effect_index = len(layer.mask_effects) - 1
+    return layer.mask_effects[layer.active_mask_effect_index]
+
+
 def layer_images(layer):
     imgs = [lc.image for lc in layer.channels if lc.image]
     if layer.mask_image:
         imgs.append(layer.mask_image)
+    imgs += [e.image for e in layer.mask_effects if e.image]
     return imgs
 
 
@@ -201,6 +233,13 @@ class PAINTSTACK_OT_layer_duplicate(Operator):
         if src.mask_image:
             dst.mask_image = src.mask_image.copy()
             dst.mask_image.name = _image_name(mat, dst, "mask")
+        for se in src.mask_effects:
+            de = dst.mask_effects.add()
+            for prop in se.bl_rna.properties:
+                if prop.identifier not in ("rna_type", "image") and not prop.is_readonly:
+                    setattr(de, prop.identifier, getattr(se, prop.identifier))
+            if se.image:
+                de.image = se.image.copy()
         compositor.composite(mat)
         return {"FINISHED"}
 
@@ -248,6 +287,80 @@ class PAINTSTACK_OT_mask_remove(Operator):
         return {"FINISHED"}
 
 
+def _active_layer(context):
+    mat, ts = texture_set(context)
+    return (mat, ts.active_layer) if mat is not None else (None, None)
+
+
+class PAINTSTACK_OT_effect_add(Operator):
+    """Add an effect (generator, filter, paint or fill) to the active layer's mask stack"""
+    bl_idname = "paintstack.effect_add"
+    bl_label = "Add Mask Effect"
+    bl_options = {"REGISTER", "UNDO"}
+
+    type: EnumProperty(items=EFFECT_TYPES)
+
+    @classmethod
+    def poll(cls, context):
+        return _active_layer(context)[1] is not None
+
+    def execute(self, context):
+        mat, layer = _active_layer(context)
+        add_mask_effect(mat, layer, self.type)
+        layer.edit_target = "MASK"
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_effect_remove(Operator):
+    """Remove the active mask effect"""
+    bl_idname = "paintstack.effect_remove"
+    bl_label = "Remove Mask Effect"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        layer = _active_layer(context)[1]
+        return layer is not None and layer.active_mask_effect is not None
+
+    def execute(self, context):
+        mat, layer = _active_layer(context)
+        effect = layer.active_mask_effect
+        if effect.image:
+            bpy.data.images.remove(effect.image)
+        layer.mask_effects.remove(layer.active_mask_effect_index)
+        layer.active_mask_effect_index = max(0, layer.active_mask_effect_index - 1)
+        undo.clear()
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
+class PAINTSTACK_OT_effect_move(Operator):
+    """Move the active mask effect up or down the stack"""
+    bl_idname = "paintstack.effect_move"
+    bl_label = "Move Mask Effect"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(items=[("UP", "Up", ""), ("DOWN", "Down", "")])
+
+    @classmethod
+    def poll(cls, context):
+        layer = _active_layer(context)[1]
+        return layer is not None and layer.active_mask_effect is not None
+
+    def execute(self, context):
+        mat, layer = _active_layer(context)
+        i = layer.active_mask_effect_index
+        # The list is drawn top-first, so "up" means later in the stack.
+        j = i + 1 if self.direction == "UP" else i - 1
+        if not 0 <= j < len(layer.mask_effects):
+            return {"CANCELLED"}
+        layer.mask_effects.move(i, j)
+        layer.active_mask_effect_index = j
+        compositor.composite(mat)
+        return {"FINISHED"}
+
+
 class PAINTSTACK_OT_composite(Operator):
     """Re-flatten the layer stack into the material's channel maps"""
     bl_idname = "paintstack.composite"
@@ -282,6 +395,9 @@ classes = (
     PAINTSTACK_OT_layer_duplicate,
     PAINTSTACK_OT_mask_add,
     PAINTSTACK_OT_mask_remove,
+    PAINTSTACK_OT_effect_add,
+    PAINTSTACK_OT_effect_remove,
+    PAINTSTACK_OT_effect_move,
     PAINTSTACK_OT_composite,
     PAINTSTACK_OT_undo_stroke,
 )

@@ -7,7 +7,7 @@ import numpy as np
 from bpy.props import EnumProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
-from . import compositor, ops, pixels
+from . import compositor, generators, ops, pixels
 from .channels import BY_ID, enabled_channels
 
 PRESETS = [
@@ -18,15 +18,22 @@ PRESETS = [
 ]
 
 
-def normal_from_height(height, strength, directx=False):
+def normal_from_height(height, strength):
     """Tangent-space normal map from a height map via central differences."""
     h = height * strength * height.shape[0] / 256.0
     dx = (np.roll(h, -1, axis=1) - np.roll(h, 1, axis=1)) * 0.5
     dy = (np.roll(h, -1, axis=0) - np.roll(h, 1, axis=0)) * 0.5
     n = np.stack([-dx, -dy, np.ones_like(h)], axis=-1)
     n /= np.linalg.norm(n, axis=-1, keepdims=True)
-    if directx:
-        n[..., 1] *= -1.0
+    return n * 0.5 + 0.5
+
+
+def combine_normals(base, detail):
+    """Whiteout blend of two tangent-space normal maps (0..1 encoded, OpenGL)."""
+    b = base * 2.0 - 1.0
+    d = detail * 2.0 - 1.0
+    n = np.stack([b[..., 0] + d[..., 0], b[..., 1] + d[..., 1], b[..., 2] * d[..., 2]], -1)
+    n /= np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-6)
     return n * 0.5 + 0.5
 
 
@@ -48,24 +55,38 @@ def build_maps(ts, preset, strength):
     metal = zero if metal is None else metal
     rough = one * BY_ID["ROUGHNESS"].default[0] if rough is None else rough
     height = gray(maps, "HEIGHT")
+    ao_map = generators.baked(ts, "AO")
+    ao = one if ao_map is None else ao_map[..., 0]
+    baked_normal = generators.baked(ts, "NORMAL")
 
     out = {}
     if "BASE_COLOR" in maps:
         out["BaseColor"] = (maps["BASE_COLOR"], True)
+    normal = baked_normal
     if height is not None:
-        out["Normal"] = (normal_from_height(height, strength, directx=preset == "UNREAL"), False)
+        detail = normal_from_height(height, strength)
+        normal = detail if normal is None else combine_normals(normal, detail)
+    if normal is not None:
+        if preset == "UNREAL":  # DirectX: green down
+            normal = normal.copy()
+            normal[..., 1] = 1.0 - normal[..., 1]
+        out["Normal"] = (normal, False)
 
     if preset == "BLENDER":
         out["Metallic"] = (np.stack([metal] * 3, -1), False)
         out["Roughness"] = (np.stack([rough] * 3, -1), False)
         if height is not None:
             out["Height"] = (np.stack([height] * 3, -1), False)
+        if ao_map is not None:
+            out["AmbientOcclusion"] = (np.stack([ao] * 3, -1), False)
     elif preset == "UNREAL":
-        out["OcclusionRoughnessMetallic"] = (np.stack([one, rough, metal], -1), False)
+        out["OcclusionRoughnessMetallic"] = (np.stack([ao, rough, metal], -1), False)
     elif preset == "UNITY":
-        out["MaskMap"] = (np.stack([metal, one, zero, 1.0 - rough], -1), False)
+        out["MaskMap"] = (np.stack([metal, ao, zero, 1.0 - rough], -1), False)
     elif preset == "GLTF":
         out["MetallicRoughness"] = (np.stack([zero, rough, metal], -1), False)
+        if ao_map is not None:
+            out["Occlusion"] = (np.stack([ao] * 3, -1), False)
     if "EMISSION" in maps:
         out["Emission"] = (maps["EMISSION"], True)
     return out

@@ -10,12 +10,13 @@ SEAM_GROW = 3  # texels the stroke spreads past UV island borders
 
 
 class Target:
-    """One image the stroke writes: a layer channel (RGBA) or a layer mask."""
+    """One image the stroke writes. mode: MASK (opaque grey mask), OVER (RGBA
+    content painted over what is there) or ERASE (remove RGBA coverage)."""
 
-    def __init__(self, image, value, is_mask):
+    def __init__(self, image, value, mode):
         self.image = image
         self.value = np.asarray(value, np.float32)
-        self.is_mask = is_mask
+        self.mode = mode
         self.orig = pixels.read(image)
         self.current = self.orig.copy()
 
@@ -37,16 +38,26 @@ class Stroke:
         projector.clear_mask()
         self.coverage = projector.coverage()
 
+        from . import ops
         erase = brush.mode == "ERASE"
         self.targets = []
         if layer.edit_target == "MASK" or layer.type == "FILL":
-            if layer.mask_image is None:
-                from . import ops
-                ops.add_mask(mat, layer)
-            self.targets.append(Target(layer.mask_image, 0.0 if erase else 1.0, True))
+            effect = layer.active_mask_effect
+            if (effect is None or effect.type != "PAINT") and layer.mask_effects:
+                # Painting under generators would be hidden by them: paint on top instead.
+                effect = ops.add_mask_effect(mat, layer, "PAINT")
+            if effect is not None and effect.type == "PAINT":
+                if effect.image is None:
+                    ops.ensure_effect_image(mat, layer, effect)
+                v = 0.0 if erase else 1.0
+                self.targets.append(Target(effect.image, (v, v, v), "OVER"))
+            else:
+                if layer.mask_image is None:
+                    ops.add_mask(mat, layer)
+                self.targets.append(Target(layer.mask_image, 0.0 if erase else 1.0, "MASK"))
+            layer.edit_target = "MASK"
             self.channels = enabled_channels(ts)
         else:
-            from . import ops
             self.channels = []
             for ch in enabled_channels(ts):
                 lc = layer.channel(ch.id)
@@ -54,19 +65,21 @@ class Stroke:
                     continue
                 if lc.image is None:
                     ops.ensure_layer_image(mat, layer, lc)
-                self.targets.append(Target(lc.image, brush.value(ch), False))
+                self.targets.append(Target(lc.image, brush.value(ch), "ERASE" if erase else "OVER"))
                 self.channels.append(ch)
-        self.erase = erase
 
         # Layers below the active one never change during the stroke, so they
         # are flattened once; layers above are read once and re-applied on top.
         idx = ts.active_layer_index
         self.below, self.above = {}, {}
+        mask_cache = {}
         for ch in self.channels:
             base = compositor.base_array(ch, ts.res)
-            entries = [compositor.layer_entry(l, ch) for l in reversed(ts.layers[idx + 1:])]
+            entries = [compositor.layer_entry(l, ch, mask_cache=mask_cache)
+                       for l in reversed(ts.layers[idx + 1:])]
             self.below[ch.id] = compositor.composite_entries(base, [e for e in entries if e])
-            above = [compositor.layer_entry(l, ch) for l in reversed(ts.layers[:idx])]
+            above = [compositor.layer_entry(l, ch, mask_cache=mask_cache)
+                     for l in reversed(ts.layers[:idx])]
             self.above[ch.id] = [e for e in above if e]
 
         undo.push(mat, {t.image.name: t.orig.copy() for t in self.targets})
@@ -113,10 +126,10 @@ class Stroke:
         overrides = {}
         for t in self.targets:
             o = t.orig
-            if t.is_mask:
+            if t.mode == "MASK":
                 val = o[..., :3] + (t.value - o[..., :3]) * m[..., None]
                 t.current = pixels.rgba(val, np.ones_like(m))
-            elif self.erase:
+            elif t.mode == "ERASE":
                 t.current = pixels.rgba(o[..., :3], o[..., 3] * (1.0 - m))
             else:
                 # Colour is blended "over" the existing content so coverage and
@@ -128,8 +141,9 @@ class Stroke:
             pixels.write(t.image, t.current)
             overrides[t.image.name] = t.current
 
+        mask_cache = {}
         for ch in self.channels:
-            entry = compositor.layer_entry(self.layer, ch, overrides)
+            entry = compositor.layer_entry(self.layer, ch, overrides, mask_cache)
             base = self.below[ch.id]
             if entry:
                 base = compositor.mix(base, entry)

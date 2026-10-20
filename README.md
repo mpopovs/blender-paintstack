@@ -6,7 +6,23 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *One stroke paints Base Color, Roughness, Metallic and Height together (gold swirl = metallic and raised, red = glossy and recessed).*
 
-## Features (v0.1, Phase 1 MVP)
+![Generators](docs/generators.png)
+
+*Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
+
+## Features (v0.2)
+
+### Phase 2: baking and smart masks
+- **Mesh-map baker** (Cycles): Normal (high → low, cage extrusion and max ray distance), Ambient Occlusion, Curvature, Thickness, Position, World Normal, ID. Baking works from the low poly alone, or from a high-poly object onto the low poly
+- **Curvature** combines Cycles pointiness with geometric curvature taken from the baked world-normal and position maps, so it picks up high-poly detail without seams at UV islands
+- **Mask stack per layer**: Paint, Fill, generators and filters, each with a blend mode (Normal, Multiply, Add, Subtract, Max, Min), opacity and invert
+- **Generators**: Edge Wear, Dirt, Curvature, Ambient Occlusion, Thickness, Position Gradient, 3D Noise. Noise is 3D value noise sampled at the baked positions, so it is seamless across UV seams
+- **Filters**: Levels, Blur
+- Painting on a mask that has generators automatically adds a **Paint** effect on top, so hand touch-ups work like in Substance
+- The baked normal is wired into the material (it is combined with the painted height), and baked AO feeds Unreal ORM, the Unity MaskMap and glTF Occlusion on export
+- Resolution option of 256 for quick look-dev
+
+### Phase 1: core painting
 
 - **Texture sets per material**: resolution 512–4K, with channels you switch on or off (Base Color, Metallic, Roughness, Height, Emission)
 - **Layer stack**: paint layers and fill layers; add, duplicate, reorder, hide, and set opacity
@@ -34,6 +50,7 @@ In Blender, go to **Edit → Preferences → Get Extensions → ⌄ → Install 
 2. Click **Create Texture Set**. This creates a "Base Material" fill layer and a "Paint 1" layer.
 3. Switch the viewport to **Material Preview**.
 4. Under **Brush**, choose the channels to paint and their values, then click **Start Painting**.
+5. For smart masks, open **Bake Mesh Maps**, optionally set a **High Poly** object, and click **Bake**. Then add a fill layer and use **+** in its mask stack to add **Edge Wear**, **Dirt** and other generators.
 
 | Key (in paint mode) | Action |
 |---|---|
@@ -54,6 +71,9 @@ paintstack/
   channels.py       PBR channel definitions
   compositor.py     numpy layer compositor (stack → output map per channel)
   material.py       Principled BSDF wiring (touches only PS_* nodes)
+  masks.py          mask stack evaluation (paint / fill / generators / levels / blur)
+  generators.py     edge wear, dirt, curvature, AO, thickness, position, 3D noise
+  baker.py          Cycles mesh-map baker with temporary emission materials
   engine/shaders.py GLSL: depth prepass, UV-space brush dab, UV coverage
   engine/projector.py  mesh → GPU batches, stroke-mask accumulation
   stroke.py         dab spacing, mirror, applying the stroke mask to all target channels
@@ -72,8 +92,10 @@ The tests run headless using Blender as a Python module, with a software OpenGL 
 ```bash
 pip install bpy numpy          # bpy wheel must match your Python version
 # Debian/Ubuntu: apt install libegl1 libegl-mesa0 libgl1-mesa-dri
-python tests/test_headless.py  # 25 checks: compositing, projection, occlusion, undo, masks, export, save/load
+python tests/test_headless.py  # Phase 1: compositing, projection, occlusion, undo, masks, export, save/load
+python tests/test_phase2.py    # Phase 2: high->low bake, every map, generators, mask stack, AO in export
 python tests/demo_render.py docs/demo.png
+python tests/demo_bake.py docs/  # bakes.png contact sheet + generators.png render
 ```
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.

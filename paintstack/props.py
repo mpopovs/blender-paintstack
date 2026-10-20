@@ -21,7 +21,41 @@ BLEND_MODES = [
     ("DIFFERENCE", "Difference", ""),
 ]
 
-RESOLUTIONS = [(str(r), str(r), "") for r in (512, 1024, 2048, 4096)]
+RESOLUTIONS = [(str(r), str(r), "") for r in (256, 512, 1024, 2048, 4096)]
+
+MASK_BLEND_MODES = [
+    ("NORMAL", "Normal", ""),
+    ("MULTIPLY", "Multiply", ""),
+    ("ADD", "Add", ""),
+    ("SUBTRACT", "Subtract", ""),
+    ("MAX", "Lighten (Max)", ""),
+    ("MIN", "Darken (Min)", ""),
+]
+
+# Mask stack effects. Generators read the texture set's baked mesh maps.
+EFFECT_TYPES = [
+    ("PAINT", "Paint", "Hand-painted mask touch-ups"),
+    ("FILL", "Fill", "Constant value"),
+    ("EDGE_WEAR", "Edge Wear", "Convex edges broken up with noise (needs Curvature)"),
+    ("DIRT", "Dirt", "Cavities and occluded areas (needs AO, Curvature)"),
+    ("CURVATURE", "Curvature", "Convexity from the baked curvature map"),
+    ("AO", "Ambient Occlusion", "Occlusion from the baked AO map"),
+    ("THICKNESS", "Thickness", "Thin areas from the baked thickness map"),
+    ("POSITION", "Position Gradient", "Gradient along an object axis (needs Position)"),
+    ("NOISE", "3D Noise", "Seamless noise sampled at the baked positions"),
+    ("LEVELS", "Levels", "Remap the mask below"),
+    ("BLUR", "Blur", "Blur the mask below"),
+]
+
+BAKE_MAPS = [
+    ("NORMAL", "Normal", "Tangent-space normal from the high poly"),
+    ("AO", "Ambient Occlusion", ""),
+    ("CURVATURE", "Curvature", ""),
+    ("THICKNESS", "Thickness", ""),
+    ("POSITION", "Position", "Bounding-box normalised object position"),
+    ("WORLD_NORMAL", "World Normal", ""),
+    ("ID", "ID", "Vertex colours, or a random colour per mesh part"),
+]
 
 
 def _recomposite(self, context):
@@ -44,6 +78,37 @@ class PS_LayerChannel(PropertyGroup):
     image: PointerProperty(type=bpy.types.Image)
 
 
+class PS_MaskEffect(PropertyGroup):
+    name: StringProperty(default="Effect")
+    type: EnumProperty(items=EFFECT_TYPES, update=_recomposite)
+    enabled: BoolProperty(default=True, update=_recomposite)
+    blend_mode: EnumProperty(items=MASK_BLEND_MODES, default="NORMAL", update=_recomposite)
+    opacity: FloatProperty(min=0.0, max=1.0, default=1.0, subtype="FACTOR", update=_recomposite)
+    invert: BoolProperty(default=False, update=_recomposite)
+
+    # Generators: smoothstep(level - softness, level + softness, source + noise)
+    level: FloatProperty(name="Level", min=0.0, max=1.0, default=0.5, subtype="FACTOR",
+                         update=_recomposite, description="Higher = more coverage")
+    softness: FloatProperty(name="Softness", min=0.001, max=1.0, default=0.15, subtype="FACTOR",
+                            update=_recomposite)
+    noise_amount: FloatProperty(name="Noise", min=0.0, max=2.0, default=0.4, update=_recomposite)
+    noise_scale: FloatProperty(name="Noise Scale", min=0.1, max=200.0, default=12.0, update=_recomposite)
+    noise_octaves: IntProperty(name="Detail", min=1, max=8, default=4, update=_recomposite)
+    seed: IntProperty(name="Seed", min=0, default=0, update=_recomposite)
+    axis: EnumProperty(name="Axis", items=[("X", "X", ""), ("Y", "Y", ""), ("Z", "Z", "")],
+                       default="Z", update=_recomposite)
+
+    value: FloatProperty(name="Value", min=0.0, max=1.0, default=1.0, subtype="FACTOR",
+                         update=_recomposite)
+    in_min: FloatProperty(name="Input Min", min=0.0, max=1.0, default=0.0, update=_recomposite)
+    in_max: FloatProperty(name="Input Max", min=0.0, max=1.0, default=1.0, update=_recomposite)
+    gamma: FloatProperty(name="Gamma", min=0.05, max=10.0, default=1.0, update=_recomposite)
+    blur_radius: IntProperty(name="Radius", min=1, max=64, default=4, subtype="PIXEL",
+                             update=_recomposite)
+    # PAINT effects: RGBA, value in R, coverage in A
+    image: PointerProperty(type=bpy.types.Image)
+
+
 class PS_Layer(PropertyGroup):
     name: StringProperty(default="Layer")
     uid: StringProperty()
@@ -60,6 +125,18 @@ class PS_Layer(PropertyGroup):
         name="Paint Target",
         items=[("CONTENT", "Content", "Paint the layer's channels", "BRUSH_DATA", 0),
                ("MASK", "Mask", "Paint the layer mask", "MOD_MASK", 1)])
+    mask_effects: CollectionProperty(type=PS_MaskEffect)
+    active_mask_effect_index: IntProperty(default=0)
+
+    @property
+    def has_mask(self):
+        return self.mask_image is not None or len(self.mask_effects) > 0
+
+    @property
+    def active_mask_effect(self):
+        if 0 <= self.active_mask_effect_index < len(self.mask_effects):
+            return self.mask_effects[self.active_mask_effect_index]
+        return None
 
     def channel(self, channel_id):
         for lc in self.channels:
@@ -71,6 +148,34 @@ class PS_Layer(PropertyGroup):
 class PS_OutputMap(PropertyGroup):
     channel: EnumProperty(items=CHANNEL_ITEMS)
     image: PointerProperty(type=bpy.types.Image)
+
+
+class PS_BakedMap(PropertyGroup):
+    map_type: EnumProperty(items=BAKE_MAPS)
+    image: PointerProperty(type=bpy.types.Image)
+
+
+def _poll_high_poly(self, obj):
+    return obj.type == "MESH"
+
+
+class PS_BakeSettings(PropertyGroup):
+    high_poly: PointerProperty(name="High Poly", type=bpy.types.Object, poll=_poll_high_poly,
+                               description="Optional detailed mesh baked onto this one")
+    cage_extrusion: FloatProperty(name="Cage Extrusion", min=0.0, default=0.05, unit="LENGTH",
+                                  description="How far outside the low poly rays start")
+    max_ray_distance: FloatProperty(name="Max Ray Distance", min=0.0, default=0.0, unit="LENGTH")
+    ao_distance: FloatProperty(name="AO Distance", min=0.001, default=0.5, unit="LENGTH")
+    thickness_distance: FloatProperty(name="Thickness Distance", min=0.001, default=0.5, unit="LENGTH")
+    samples: IntProperty(name="Samples", min=1, max=1024, default=32)
+    margin: IntProperty(name="Margin", min=0, max=64, default=8, subtype="PIXEL")
+    use_normal: BoolProperty(name="Normal", default=True)
+    use_ao: BoolProperty(name="Ambient Occlusion", default=True)
+    use_curvature: BoolProperty(name="Curvature", default=True)
+    use_thickness: BoolProperty(name="Thickness", default=True)
+    use_position: BoolProperty(name="Position", default=True)
+    use_world_normal: BoolProperty(name="World Normal", default=True)
+    use_id: BoolProperty(name="ID", default=False)
 
 
 def _resolution_changed(self, context):
@@ -96,6 +201,9 @@ class PS_TextureSet(PropertyGroup):
     layers: CollectionProperty(type=PS_Layer)
     active_layer_index: IntProperty(default=0)
     outputs: CollectionProperty(type=PS_OutputMap)
+    baked: CollectionProperty(type=PS_BakedMap)
+    bake: PointerProperty(type=PS_BakeSettings)
+    use_baked_normal: BoolProperty(name="Use Baked Normal", default=True, update=_rebuild_material)
 
     @property
     def res(self):
@@ -111,6 +219,12 @@ class PS_TextureSet(PropertyGroup):
         for o in self.outputs:
             if o.channel == channel_id:
                 return o.image
+        return None
+
+    def baked_map(self, map_type):
+        for b in self.baked:
+            if b.map_type == map_type:
+                return b.image
         return None
 
 
@@ -146,7 +260,8 @@ class PS_Brush(PropertyGroup):
         return tuple(v) if ch.is_color else (v, v, v)
 
 
-classes = (PS_LayerChannel, PS_Layer, PS_OutputMap, PS_TextureSet, PS_Brush)
+classes = (PS_LayerChannel, PS_MaskEffect, PS_Layer, PS_OutputMap, PS_BakedMap,
+           PS_BakeSettings, PS_TextureSet, PS_Brush)
 
 
 def register():
