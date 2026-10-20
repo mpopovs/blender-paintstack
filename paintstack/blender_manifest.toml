@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "paintstack"
+version = "0.1.0"
+name = "PaintStack"
+tagline = "Layer-based multi-channel PBR texture painting"
+maintainer = "PaintStack contributors"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Paint", "Material", "3D View"]
+
+[permissions]
+files = "Export texture maps to disk"
