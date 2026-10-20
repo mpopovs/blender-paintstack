@@ -10,7 +10,25 @@
 | 5. Performance | ✅ v0.5 | Region (dirty-rectangle) strokes with partial GPU readback; a persistent compositor cache with per-layer and per-channel invalidation and a memory budget; a below-checkpoint; cover culling; sparse and in-place blending; deferred layer writes. 3–42× faster (see the README) |
 | 6. Apple Silicon | ✅ v0.6 | Metal-safe formats, a GPU live stroke preview (regions and mips), multithreaded compositing, unified-memory cache sizing, Retina and Mac input, on-machine diagnostics, a GPU state crash fix |
 | 7. GPU compositor | ✅ v0.7 | GPU blending, folders and filters checked against the CPU; display without uploads plus idle sync; Auto backend with CPU fallback; a Mac test kit and report |
-| 8. Scale | next | UDIM texture sets, 8K (half-float GPU-resident layers), masks and generators on the GPU, and tuning from the M2 test report |
+| 8. Scale | ✅ v0.8 | UDIM texture sets, masks and generators on the GPU, cheap slider drags and stroke starts on the GPU path (tuned from the M2 Pro report) |
+| 9. GPU-resident layers | next | Layer contents, stroke application and undo on the GPU, which makes 8K (and large UDIM sets) possible; see below |
+
+## Phase 9 plan: GPU-resident layers (and 8K)
+
+**Why 8K is not in Phase 8:** at 8K, one float32 RGBA array is 1 GB. Today a painted layer channel exists as Blender's 8-bit image (256 MB), a decoded float32 cache entry (1 GB), a GPU upload (512 MB), and during a stroke a working copy (1 GB) plus a full-size undo copy (1 GB). A four-channel paint layer would need about 7.5 GB, so a 16 GB Mac would swap or run out of memory. Shipping an 8K option on top of that would be misleading. The same limits apply to large UDIM sets: 4 tiles at 4K hold as many texels as one 8K image.
+
+The plan is to make the GPU the owner of layer contents:
+1. **Layer textures**: each layer image lives in a GPU texture (RGBA8, or RGBA16F for float channels) that the compositor samples directly. The decoded CPU cache is dropped on the GPU path.
+2. **GPU stroke application**: the stroke mask is already on the GPU. Applying it to the layer textures (over / erase / mask modes) and compositing the touched regions with the GPU compositor removes the mask readback, the CPU apply and the CPU region composite.
+3. **Region undo**: store only the touched tiles of a layer (on the GPU, or compressed on the CPU) instead of full-size copies.
+4. **Lazy sync**: the CPU images are written from the GPU when Blender needs them (idle, save, export), as the outputs already are.
+5. Then add **8192** to the resolutions, with a memory estimate in the panel.
+
+## Known limitations (v0.8)
+
+- No 8K yet (see the Phase 9 plan). UDIM layouts are limited to 16384 texels per side (e.g. 4 tiles in a row at 4K, or 8 at 2K), and every texel of the layout is stored, including unused cells of the 10-column grid.
+- Smart materials saved at one tile, when applied to a UDIM texture set, are stretched over the whole layout if they contain painted images. Fills and generators adapt per tile.
+- The CPU masks are still computed for strokes, the CPU backend and anchors. The GPU masks only replace them in GPU composites.
 
 ## Phase 7 plan (formerly the Phase 6 plan; step 1 shipped in v0.6)
 

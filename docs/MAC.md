@@ -59,3 +59,5 @@ Install the add-on zip, open the default cube scene, select the cube, then click
 - [ ] With a pen or Sidecar, **Pressure → Flow** changes stroke strength.
 - [ ] Dragging a layer's **Opacity** slider updates the viewport smoothly. The GPU compositor is in use if **System** shows `Metal` and the preferences say Auto.
 - [ ] Saving, closing and reopening the .blend keeps everything you painted.
+- [ ] Dragging a generator's **Level** slider (e.g. Edge Wear) updates the viewport smoothly at 2K.
+- [ ] UDIM: on a mesh with UVs in tiles 1001 and 1002, click the **UV** button next to **UDIM**. A stroke across the tile border paints both tiles, and **Export Textures** writes `.1001` and `.1002` files.

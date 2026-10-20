@@ -18,7 +18,16 @@ Layered, multi-channel PBR texture painting for Blender, in the spirit of Substa
 
 *Smart masks made by generators from baked maps: an Edge Wear generator on a metal fill layer and a Dirt generator on a grime fill layer, over a blue paint base. No hand painting.*
 
-## Features (v0.7)
+## Features (v0.8)
+
+### Phase 8: UDIM, GPU masks and M2 tuning
+- **UDIM texture sets**: enter tiles in the **UDIM** field (e.g. `1001-1004, 1011`) or click the **UV** button next to it to detect them from the object's UVs. Each tile gets the full resolution. Painting crosses tile borders, and baking, generators, filters, the GPU compositor and export all work per tile. Export writes `<name>_<map>.<tile>.png`, the naming every DCC and game engine reads. The images hold the tiles side by side as laid out in UV space. A layout larger than the GPU limit of 16384 texels per side is refused, and the panel says why
+- **Masks and generators on the GPU**: when the GPU compositor runs, the whole mask stack is evaluated in GLSL. That covers the mask image, paint, fill, every generator, colour selection, levels, blur and the blend modes. Generator sources and the 3D noise field stay on the GPU, so dragging **Level**, **Softness** or **Noise** costs no CPU work. Each effect type is checked against the CPU masks (`tests/test_phase8.py`)
+- **Tuned from the M2 Pro report**:
+  - Opacity, colour, blend-mode and visibility changes keep the layer's cached pixels and mask, and the GPU blends layers from their cached parts, so dragging those sliders uploads nothing.
+  - Strokes start without first writing every output image. With the live preview they paint straight into the GPU results, and mip levels and the sRGB conversion are computed on the GPU.
+  - Applying the stroke mask and compositing a stroke's channels run on all performance cores.
+- The benchmark also times a generator **Level** drag (`tweak_mask_level_ms`)
 
 ### Phase 7: GPU compositor and Mac testing
 - **GPU compositor**: blend modes, pass-through folders, masks and filters (blur, sharpen, HSL, warp) run in GLSL on the GPU (Metal on Apple Silicon). Layer entries and masks are still prepared and cached on the CPU, and uploads are cached by identity, so a tweak only uploads what changed. It is checked against the CPU compositor on every stack type (`tests/test_phase7.py`), with a maximum difference of one 8-bit step
@@ -130,7 +139,8 @@ In Blender, go to **Edit → Preferences → Get Extensions → ⌄ → Install 
 2. Click **Create Texture Set**. This creates a "Base Material" fill layer and a "Paint 1" layer.
 3. Switch the viewport to **Material Preview**.
 4. Under **Brush**, choose the channels to paint and their values, then click **Start Painting**.
-5. For smart materials and masks, open **Bake Mesh Maps**, optionally set a **High Poly** object, and click **Bake**. Then add a fill layer and use **+** in its mask stack to add **Edge Wear**, **Dirt** and other generators, or pick one from **Smart Assets → Smart Material / Smart Mask**.
+5. For a UDIM mesh, click the **UV** button next to **UDIM** to detect the tiles (before or after painting; existing paint stays on tile 1001).
+6. For smart materials and masks, open **Bake Mesh Maps**, optionally set a **High Poly** object, and click **Bake**. Then add a fill layer and use **+** in its mask stack to add **Edge Wear**, **Dirt** and other generators, or pick one from **Smart Assets → Smart Material / Smart Mask**.
 
 | Key (in paint mode) | Action |
 |---|---|

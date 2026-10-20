@@ -13,6 +13,7 @@ import time
 
 import bpy
 import gpu
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -118,11 +119,21 @@ def main(sizes=None, backend=None):
         tw = timed(tweak)
         tweak_color()
         twc = timed(tweak_color)
+        effect = top.mask_effects[0]  # the Dirt generator on the top fill
+        levels = iter(np.linspace(0.2, 0.8, 16))
+
+        def tweak_level():
+            # A generator Level drag: every step is a new value (no cache hit).
+            effect.level = float(next(levels))
+            compositor._flush()
+        tweak_level()
+        twl = timed(tweak_level)
         start, upd, fin = stroke_bench(obj, mat)
         compositor.BACKEND_OVERRIDE = compositor.DEFER_OVERRIDE = None
         row = {"backend": backend or "AUTO", "res": res, "composite_ms": round(full),
                "tweak_top_layer_ms": round(tw),
                "tweak_color_ms": round(twc),
+               "tweak_mask_level_ms": round(twl),
                "stroke_start_ms": round(start), "stroke_update_ms": round(upd), "stroke_finish_ms": round(fin)}
         rows.append(row)
         print(json.dumps(row))
